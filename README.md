@@ -13,7 +13,7 @@ Download a platform ZIP from this repository's **Releases** page, or the **Build
 
 Python, Qt, FFmpeg, ffprobe and Python package dependencies are included by GitHub Actions. Users do not compile packages, install Python, use pip or install FFmpeg. The first launch needs internet access for the official yt-dlp nightly executable and Deno. macOS builds are currently unsigned and unnotarized.
 
-Paste YouTube links, choose MP3/MP4 and quality, select an output folder, and add them to the queue. Downloads run sequentially with conversion and ffprobe validation before advancing. The app supports stopping after the current item, cancellation, retrying failures and restoring the queue. Only individual videos are downloaded.
+Paste YouTube links, choose Video (MP4) or Audio (MP3), and click **İndir**. The save folder is remembered. Optional quality controls are under **Kalite ve ayarlar**; update, retry, cleanup and diagnostic actions are in **Diğer**. The download list appears when videos are added. Downloads run sequentially with conversion and ffprobe validation before advancing. The app supports stopping after the current item, cancellation, retrying failures and restoring the queue. Only individual videos are downloaded.
 
 ## Saved settings and updates
 

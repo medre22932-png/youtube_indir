@@ -390,7 +390,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QMenu, QScrollArea, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 
@@ -446,11 +446,10 @@ class Window(QMainWindow):
         self.output_buffer = ""
         self.log_lines: list[str] = []
         self.setWindowTitle("YT İndir · MP3 ve MP4")
-        self.resize(1120, 800)
-        self.setMinimumSize(900, 700)
+        self.resize(760, 620)
+        self.setMinimumSize(640, 540)
         self.build_ui()
         self.refresh_table()
-        self.restoreGeometry(self.settings.value("geometry", b""))
         self.quality.setCurrentIndex(max(0, self.quality.findData(self.settings.value("quality", "128" if self.format.currentText() == "MP3" else "best"))))
         if auto_update:
             QTimer.singleShot(0, self.check_updates)
@@ -458,97 +457,150 @@ class Window(QMainWindow):
     def build_ui(self):
         root = QWidget(objectName="root")
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(26, 22, 26, 22)
-        layout.setSpacing(13)
-        layout.addWidget(QLabel("YT İndir", objectName="heading"))
-        layout.addWidget(QLabel("YouTube bağlantılarını ekleyin. MP3 veya MP4 olarak sırayla indirin.", objectName="subheading"))
+        layout.setContentsMargins(30, 26, 30, 26)
+        layout.setSpacing(16)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("YT İndir", objectName="heading"))
+        header.addStretch()
+        more = QPushButton("Diğer ⋯")
+        menu = QMenu(more)
+        menu.addAction("İndirilen klasörü aç", self.open_folder)
+        menu.addAction("Başarısız indirmeleri yeniden sırala", self.retry_failed)
+        menu.addAction("Tamamlananları temizle", self.clear_finished)
+        menu.addSeparator()
+        self.update_button = menu.addAction("Güncellemeleri denetle", self.check_updates)
+        menu.addAction("Yeni uygulama sürümleri", lambda: QDesktopServices.openUrl(
+            QUrl(f"https://github.com/{APP_REPOSITORY}/releases")))
+        details_action = menu.addAction("İşlem ayrıntılarını göster")
+        details_action.setCheckable(True)
+        more.setMenu(menu)
+        header.addWidget(more)
+        layout.addLayout(header)
+        layout.addWidget(QLabel("Bağlantıyı yapıştırın, biçimi seçin ve indirin.", objectName="subheading"))
         self.links = QPlainTextEdit()
-        self.links.setPlaceholderText("YouTube bağlantılarını buraya yapıştırın — her satıra bir bağlantı")
-        self.links.setMaximumHeight(110)
+        self.links.setPlaceholderText("YouTube bağlantısını buraya yapıştırın\nBirden fazla video için her satıra bir bağlantı ekleyin.")
+        self.links.setFixedHeight(94)
         self.links.setAccessibleName("YouTube bağlantıları")
         layout.addWidget(self.links)
-        controls = QGridLayout()
+
         self.format = QComboBox()
         self.format.addItems(["MP4", "MP3"])
         self.format.setCurrentText(self.settings.value("format", "MP4"))
+        self.format.hide()
+        formats = QHBoxLayout()
+        self.video_button = QPushButton("Video · MP4")
+        self.audio_button = QPushButton("Yalnızca ses · MP3")
+        for button, value in ((self.video_button, "MP4"), (self.audio_button, "MP3")):
+            button.setCheckable(True)
+            button.setMinimumHeight(46)
+            button.clicked.connect(lambda checked=False, value=value: self.select_format(value))
+            formats.addWidget(button)
+        layout.addLayout(formats)
         self.quality = QComboBox()
+        self.quality.setMinimumHeight(36)
         self.format.currentTextChanged.connect(self.update_qualities)
         self.update_qualities()
-        controls.addWidget(QLabel("Biçim"), 0, 0)
-        controls.addWidget(QLabel("Kalite"), 0, 1)
-        controls.addWidget(self.format, 1, 0)
-        controls.addWidget(self.quality, 1, 1)
+        self.select_format(self.format.currentText())
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Kayıt yeri", objectName="subheading"))
         self.folder = QLineEdit(str(self.settings.value("folder", str(Path.home() / "Downloads" / "YT İndir"))))
+        self.folder.setReadOnly(True)
         self.folder.setAccessibleName("Kayıt klasörü")
-        browse = QPushButton("Klasör seç…")
+        folder_row.addWidget(self.folder, 1)
+        browse = QPushButton("Değiştir")
         browse.clicked.connect(self.choose_folder)
-        controls.addWidget(QLabel("Kayıt klasörü"), 0, 2)
-        controls.addWidget(self.folder, 1, 2)
-        controls.addWidget(browse, 1, 3)
-        controls.setColumnStretch(2, 1)
-        layout.addLayout(controls)
-        add_row = QHBoxLayout()
-        add = QPushButton("Sıraya ekle")
-        add.clicked.connect(self.add_links)
-        add_row.addWidget(add)
-        add_row.addWidget(QLabel("Yeni eklenenler, geçerli biçim ve kaliteyle kaydedilir.", objectName="subheading"))
-        add_row.addStretch()
-        layout.addLayout(add_row)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Video / Bağlantı", "Biçim", "Kalite", "Durum", "İlerleme"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, 5):
-            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().hide()
-        self.table.itemDoubleClicked.connect(self.show_job)
-        layout.addWidget(self.table, 1)
+        folder_row.addWidget(browse)
+        layout.addLayout(folder_row)
+
+        options_button = QPushButton("Kalite ve ayarlar ▸")
+        options_button.setCheckable(True)
+        layout.addWidget(options_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.options = QWidget()
+        options_layout = QVBoxLayout(self.options)
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("İndirme kalitesi"))
+        quality_row.addWidget(self.quality, 1)
+        options_layout.addLayout(quality_row)
+        self.engine_status = QLabel("Gerekli güncellemeler otomatik denetlenir.", objectName="subheading")
+        self.engine_status.setWordWrap(True)
+        options_layout.addWidget(self.engine_status)
+        self.options.hide()
+        options_button.toggled.connect(self.options.setVisible)
+        options_button.toggled.connect(lambda checked: options_button.setText(
+            "Kalite ve ayarlar ▾" if checked else "Kalite ve ayarlar ▸"))
+        layout.addWidget(self.options)
+
         actions = QHBoxLayout()
-        self.start = QPushButton("İndirmeyi başlat", objectName="primary")
+        self.start = QPushButton("İndir", objectName="primary")
+        self.start.setMinimumHeight(48)
         self.start.clicked.connect(self.start_batch)
-        self.stop = QPushButton("Geçerli bitince dur")
+        actions.addWidget(self.start, 1)
+        self.add_button = QPushButton("Sıraya ekle")
+        self.add_button.clicked.connect(self.add_links)
+        actions.addWidget(self.add_button)
+        self.stop = QPushButton("Bu video bitince dur")
         self.stop.clicked.connect(self.request_stop)
-        self.cancel = QPushButton("Geçerli indirmeyi iptal et")
+        actions.addWidget(self.stop)
+        self.cancel = QPushButton("İptal et")
         self.cancel.clicked.connect(self.cancel_current)
-        retry = QPushButton("Başarısızları yeniden sırala")
-        retry.clicked.connect(self.retry_failed)
-        clear = QPushButton("Bitenleri temizle")
-        clear.clicked.connect(self.clear_finished)
-        for button in (self.start, self.stop, self.cancel, retry, clear):
-            actions.addWidget(button)
+        actions.addWidget(self.cancel)
         layout.addLayout(actions)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.hide()
         layout.addWidget(self.progress)
-        self.status = QLabel("Hazır. Bağlantıları ekleyin.")
+        self.status = QLabel("Hazır. İlk bağlantınızı yukarıya yapıştırın.", objectName="subheading")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        engine_row = QHBoxLayout()
-        self.engine_status = QLabel("İndirme motoru henüz denetlenmedi.", objectName="subheading")
-        self.engine_status.setWordWrap(True)
-        engine_row.addWidget(self.engine_status, 1)
-        self.update_button = QPushButton("Güncellemeleri denetle")
-        self.update_button.clicked.connect(self.check_updates)
-        engine_row.addWidget(self.update_button)
-        open_folder = QPushButton("Klasörü aç")
-        open_folder.clicked.connect(self.open_folder)
-        engine_row.addWidget(open_folder)
-        releases = QPushButton("Uygulama sürümleri")
-        releases.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{APP_REPOSITORY}/releases")))
-        engine_row.addWidget(releases)
-        layout.addLayout(engine_row)
+
+        self.queue_label = QLabel("İndirmeler", objectName="subheading")
+        layout.addWidget(self.queue_label)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Video", "Biçim", "Durum"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2):
+            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().hide()
+        self.table.setMinimumHeight(130)
+        self.table.itemDoubleClicked.connect(self.show_job)
+        layout.addWidget(self.table, 1)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
         self.details.setMaximumBlockCount(500)
-        self.details.setMaximumHeight(100)
-        self.details.setPlaceholderText("İşlem ayrıntıları burada görünür. Hata ayrıntıları için kuyruktaki satıra çift tıklayın.")
+        self.details.setMaximumHeight(110)
+        self.details.hide()
+        details_action.toggled.connect(self.details.setVisible)
         layout.addWidget(self.details)
-        self.setCentralWidget(root)
-        self.setStyleSheet(STYLE)
+        layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
+        self.setStyleSheet(STYLE + """
+QPushButton:checked { background: #243f65; border: 2px solid #6b9df7; color: #ffffff; }
+QMenu { background: #1a2332; color: #e6edf7; border: 1px solid #344258; padding: 6px; }
+QMenu::item { padding: 9px 18px; }
+QMenu::item:selected { background: #345b9f; }
+QLineEdit:read-only { background: transparent; border: none; color: #afc0d7; }
+QScrollArea { background: #111722; }
+QScrollBar:vertical { background: #111722; width: 10px; }
+QScrollBar::handle:vertical { background: #344258; border-radius: 5px; min-height: 28px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+""")
         self.sync_buttons()
+
+    def select_format(self, value):
+        self.format.setCurrentText(value)
+        self.video_button.setChecked(value == "MP4")
+        self.audio_button.setChecked(value == "MP3")
 
     def update_qualities(self):
         self.quality.clear()
@@ -566,6 +618,11 @@ class Window(QMainWindow):
         self.stop.setEnabled(self.running)
         self.cancel.setEnabled(self.current is not None and not self.cancelled)
         self.update_button.setEnabled(not self.running and not updating)
+        self.start.setText("Hazırlanıyor…" if updating else "İndiriliyor…" if self.running else "İndir")
+        self.stop.setVisible(self.running)
+        self.cancel.setVisible(self.current is not None)
+        self.add_button.setVisible(self.running)
+        self.progress.setVisible(self.running or self.pending_start)
 
     def log(self, text: str):
         self.details.appendPlainText(text)
@@ -590,11 +647,15 @@ class Window(QMainWindow):
             self.status.setText(f"Kuyruk kaydedilemedi: {error}")
 
     def refresh_table(self):
+        self.queue_label.setVisible(bool(self.jobs))
+        self.table.setVisible(bool(self.jobs))
+        self.queue_label.setText(f"İndirmeler · {len(self.jobs)} video")
         self.table.setRowCount(len(self.jobs))
         for row, job in enumerate(self.jobs):
             quality = "En iyi" if job.quality == "best" else job.quality + (" kbps" if job.format == "MP3" else "p")
             title = job.url if job.title == "Bağlantı bilgisi bekleniyor" else job.title
-            for col, value in enumerate((title, job.format, quality, job.status, f"%{job.progress}")):
+            state = f"{job.status} · %{job.progress}" if job.status == "İndiriliyor" else job.status
+            for col, value in enumerate((title, f"{job.format} · {quality}", state)):
                 item = QTableWidgetItem(value)
                 item.setToolTip(job.error or job.output or job.url)
                 self.table.setItem(row, col, item)
@@ -607,7 +668,7 @@ class Window(QMainWindow):
                 raise ValueError("Bir kayıt klasörü seçin.")
         except ValueError as error:
             QMessageBox.warning(self, "Bağlantıları kontrol edin", str(error))
-            return
+            return False
         for url in links:
             self.jobs.append(Job(url, self.format.currentText(), self.quality.currentData(), folder))
         self.links.clear()
@@ -617,6 +678,7 @@ class Window(QMainWindow):
         self.persist()
         self.refresh_table()
         self.status.setText(f"{len(links)} bağlantı sıraya eklendi.")
+        return True
 
     def retry_failed(self):
         for job in self.jobs:
@@ -704,12 +766,12 @@ class Window(QMainWindow):
             self.sync_buttons()
 
     def start_batch(self):
+        if self.links.toPlainText().strip() and not self.add_links():
+            return
         if not any(job.status == "Bekliyor" for job in self.jobs):
-            if self.links.toPlainText().strip():
-                self.add_links()
-            if not any(job.status == "Bekliyor" for job in self.jobs):
-                QMessageBox.information(self, "İndirme sırası", "Önce bağlantıları sıraya ekleyin.")
-                return
+            self.links.setFocus()
+            self.status.setText("İndirmek için bir YouTube bağlantısı yapıştırın.")
+            return
         self.ffmpeg = find_tool("ffmpeg", self.data_dir)
         self.ffprobe = find_tool("ffprobe", self.data_dir)
         if not self.ffmpeg or not self.ffprobe:
