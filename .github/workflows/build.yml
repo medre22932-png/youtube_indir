@@ -1,14 +1,53 @@
-name: Build desktop apps
+name: Build and release desktop apps
 on:
   push:
     branches: [main]
-    tags: ['v*']
-  pull_request:
+    paths:
+      - youtube_indir.py
+      - YTIndir.spec
+      - requirements.txt
+      - .github/workflows/build.yml
   workflow_dispatch:
+concurrency:
+  group: build-and-release
+  cancel-in-progress: false
 permissions:
   contents: read
 jobs:
+  prepare-release:
+    name: Prepare latest release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove old Actions artifacts
+        shell: bash
+        run: |
+          ids=$(gh api --paginate "repos/$GH_REPO/actions/artifacts" --jq '.artifacts[].id')
+          for id in $ids; do
+            gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$id"
+          done
+      - name: Prepare draft latest release
+        shell: bash
+        run: |
+          existing=$(gh release list --limit 100 --json tagName --jq '.[] | select(.tagName == "latest") | .tagName')
+          if [[ "$existing" == "latest" ]]; then
+            gh release delete latest --yes --cleanup-tag
+          fi
+          gh release create latest --target "$BUILD_SHA" --draft \
+            --title "Latest build (${BUILD_SHA:0:7})" \
+            --notes 'Building and checking Windows and Apple Silicon macOS downloads.'
+          gh release upload latest youtube_indir.py --clobber
   build:
+    needs: prepare-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -55,39 +94,49 @@ jobs:
             'dist/YT İndir.app/Contents/MacOS/YTIndir' --smoke-test
           fi
           python -c "import json, os; from pathlib import Path; p=Path(os.environ['YTINDIR_DATA_DIR']); assert json.loads((p/'bundle-check.json').read_text())['frozen']; assert json.loads((p/'smoke.json').read_text())['frozen']; assert (p/'preview.png').is_file()"
-      - name: Archive Windows executable
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path dist/YTIndir.exe -DestinationPath dist/YTIndir-${{ matrix.platform }}.zip
       - name: Archive macOS app preserving permissions and links
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent 'dist/YT İndir.app' dist/YTIndir-${{ matrix.platform }}.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: YTIndir-${{ matrix.platform }}
-          path: dist/YTIndir-${{ matrix.platform }}.zip
-          if-no-files-found: error
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+      - name: Upload directly to latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export RELEASE_ASSET=dist/YTIndir.exe
+          else
+            export RELEASE_ASSET=dist/YTIndir-macos-arm64.zip
+          fi
+          python -c "import hashlib, os; from pathlib import Path; p=Path(os.environ['RELEASE_ASSET']); Path(str(p)+'.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n', encoding='utf-8')"
+          gh release upload latest "$RELEASE_ASSET" "$RELEASE_ASSET.sha256" --clobber
+  finalize-release:
+    name: Publish checked downloads
+    needs: [prepare-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: YTIndir-*
-          merge-multiple: true
-          path: release
-      - name: Publish release with checksums and single Python source
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+      - name: Combine checksums and publish release
         shell: bash
         run: |
-          cp youtube_indir.py release/youtube_indir.py
-          cd release
-          sha256sum *.zip > SHA256SUMS
-          gh release create "$TAG" *.zip youtube_indir.py SHA256SUMS --repo "$REPOSITORY" --verify-tag --generate-notes
+          gh release download latest --pattern '*.sha256' --dir checksums
+          cat checksums/YTIndir.exe.sha256 checksums/YTIndir-macos-arm64.zip.sha256 > SHA256SUMS
+          gh release upload latest SHA256SUMS --clobber
+          cat > release-notes.md <<EOF
+          Built from commit \`$BUILD_SHA\`. Both packaged apps passed GUI and FFmpeg checks.
+
+          Downloads:
+          - [Windows x64 — YTIndir.exe](https://github.com/$GH_REPO/releases/download/latest/YTIndir.exe)
+          - [Apple Silicon Mac — ZIP](https://github.com/$GH_REPO/releases/download/latest/YTIndir-macos-arm64.zip)
+          - [Single Python source](https://github.com/$GH_REPO/releases/download/latest/youtube_indir.py)
+          - [SHA-256 checksums](https://github.com/$GH_REPO/releases/download/latest/SHA256SUMS)
+
+          Windows: run the EXE directly. Mac: unzip and move YT İndir.app to Applications.
+          Saved settings and engine updates remain in your user data folder.
+          EOF
+          gh release edit latest --draft=false --latest --notes-file release-notes.md

@@ -6,9 +6,9 @@ The remaining supporting files are needed for dependency installation, GitHub bu
 
 ## Download and use
 
-Download a platform ZIP from this repository's **Releases** page, or the **Build desktop apps** workflow artifacts:
+Download from this repository's **Releases → latest** page:
 
-- Windows x64: extract and launch `YTIndir.exe` (single executable).
+- Windows x64: download and launch `YTIndir.exe` directly (single executable).
 - Apple Silicon: extract `YTIndir-macos-arm64.zip` and move `YT İndir.app` to Applications.
 
 Python, Qt, FFmpeg, ffprobe and Python package dependencies are included by GitHub Actions. Users do not compile packages, install Python, use pip or install FFmpeg. The first launch needs internet access for the official yt-dlp nightly executable and Deno. macOS builds are currently unsigned and unnotarized.
@@ -33,7 +33,11 @@ FFmpeg and the Python/Qt packages are updated by rebuilding the app on GitHub. *
 
 ## GitHub builds
 
-`.github/workflows/build.yml` runs on pushes to `main`, pull requests, version tags and manual dispatch. Separate native runners build Windows x64 and Apple Silicon (macOS ARM64) packages. The workflow installs dependencies and FFmpeg on GitHub, checks the source, packages the app with PyInstaller and checks the packaged GUI and embedded FFmpeg/ffprobe. Both archives must build successfully before a `v*` tag publishes a release with SHA-256 checksums. Push a version tag such as `v1.0.0` to publish; regular pushes only create workflow artifacts.
+`.github/workflows/build.yml` runs when application/build files change on `main`, or by manual dispatch. No version tag is required. Separate native runners build Windows x64 and Apple Silicon (macOS ARM64) packages, then check each packaged GUI and embedded FFmpeg/ffprobe.
+
+Like the translation project, each runner uploads directly to the `latest` GitHub Release. The workflow never uploads or downloads Actions build artifacts; its preparation step removes artifacts left by previous workflows. Python dependency caching remains enabled.
+
+The workflow recreates `latest` as a draft, uploads `YTIndir.exe`, `YTIndir-macos-arm64.zip`, the single Python source and SHA-256 checksums, and publishes the release after both platform jobs succeed. A failed build leaves the new release as a draft. The previous `latest` release is replaced during preparation. Runs are serialized to prevent overlapping uploads. Local edits do not trigger GitHub builds until you push them.
 
 macOS signing/notarization is not configured. Include licenses and corresponding-source access for redistributed FFmpeg and other bundled libraries before public binary distribution.
 
