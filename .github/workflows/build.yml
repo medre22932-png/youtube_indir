@@ -1,0 +1,95 @@
+name: Build desktop apps
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: macos-15
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Python packages on GitHub
+        run: python -m pip install -r requirements-dev.txt
+      - name: Install FFmpeg on macOS runner
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg on Windows runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          $binary = Get-ChildItem 'C:\ProgramData\chocolatey\lib\ffmpeg' -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $binary) { throw 'FFmpeg installation missing' }
+          $binary.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Test application
+        run: python -m pytest -q
+      - name: Package Python, Qt, FFmpeg and dependencies
+        run: python -m PyInstaller --clean --noconfirm YTIndir.spec
+      - name: Check packaged binaries and GUI
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+          YTINDIR_DATA_DIR: ${{ runner.temp }}/ytindir-smoke
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            dist/YTIndir.exe --check-bundle
+            dist/YTIndir.exe --smoke-test
+          else
+            'dist/YT İndir.app/Contents/MacOS/YTIndir' --check-bundle
+            'dist/YT İndir.app/Contents/MacOS/YTIndir' --smoke-test
+          fi
+          python -c "import json, os; from pathlib import Path; p=Path(os.environ['YTINDIR_DATA_DIR']); assert json.loads((p/'bundle-check.json').read_text())['frozen']; assert json.loads((p/'smoke.json').read_text())['frozen']; assert (p/'preview.png').is_file()"
+      - name: Archive Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/YTIndir.exe -DestinationPath dist/YTIndir-${{ matrix.platform }}.zip
+      - name: Archive macOS app preserving permissions and links
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent 'dist/YT İndir.app' dist/YTIndir-${{ matrix.platform }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YTIndir-${{ matrix.platform }}
+          path: dist/YTIndir-${{ matrix.platform }}.zip
+          if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: YTIndir-*
+          merge-multiple: true
+          path: release
+      - name: Publish release with checksums and single Python source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          cp main.py release/main.py
+          cd release
+          sha256sum *.zip > SHA256SUMS
+          gh release create "$TAG" *.zip main.py SHA256SUMS --repo "$REPOSITORY" --verify-tag --generate-notes
