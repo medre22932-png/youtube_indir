@@ -10,7 +10,6 @@ Download a platform ZIP from this repository's **Releases** page, or the **Build
 
 - Windows x64: extract and launch `YTIndir.exe` (single executable).
 - Apple Silicon: extract `YTIndir-macos-arm64.zip` and move `YT İndir.app` to Applications.
-- Intel Mac: use `YTIndir-macos-x64.zip`.
 
 Python, Qt, FFmpeg, ffprobe and Python package dependencies are included by GitHub Actions. Users do not compile packages, install Python, use pip or install FFmpeg. The first launch needs internet access for the official yt-dlp nightly executable and Deno. macOS builds are currently unsigned and unnotarized.
 
@@ -34,7 +33,7 @@ FFmpeg and the Python/Qt packages are updated by rebuilding the app on GitHub. *
 
 ## GitHub builds
 
-`.github/workflows/build.yml` runs on pushes to `main`, pull requests, version tags and manual dispatch. Separate native runners build Windows x64, macOS ARM64 and macOS Intel packages. The workflow installs dependencies and FFmpeg on GitHub, checks the source, packages the app with PyInstaller and checks the packaged GUI and embedded FFmpeg/ffprobe. All three archives must build successfully before a `v*` tag publishes a release with SHA-256 checksums. Push a version tag such as `v1.0.0` to publish; regular pushes only create workflow artifacts.
+`.github/workflows/build.yml` runs on pushes to `main`, pull requests, version tags and manual dispatch. Separate native runners build Windows x64 and Apple Silicon (macOS ARM64) packages. The workflow installs dependencies and FFmpeg on GitHub, checks the source, packages the app with PyInstaller and checks the packaged GUI and embedded FFmpeg/ffprobe. Both archives must build successfully before a `v*` tag publishes a release with SHA-256 checksums. Push a version tag such as `v1.0.0` to publish; regular pushes only create workflow artifacts.
 
 macOS signing/notarization is not configured. Include licenses and corresponding-source access for redistributed FFmpeg and other bundled libraries before public binary distribution.
 
