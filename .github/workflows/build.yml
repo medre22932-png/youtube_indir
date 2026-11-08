@@ -81,19 +81,41 @@ jobs:
       - name: Package Python, Qt, FFmpeg and dependencies
         run: python -m PyInstaller --clean --noconfirm YTIndir.spec
       - name: Check packaged binaries and GUI
-        shell: bash
+        shell: python
         env:
           QT_QPA_PLATFORM: offscreen
           YTINDIR_DATA_DIR: ${{ runner.temp }}/ytindir-smoke
         run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            dist/YTIndir.exe --check-bundle
-            dist/YTIndir.exe --smoke-test
-          else
-            'dist/YT İndir.app/Contents/MacOS/YTIndir' --check-bundle
-            'dist/YT İndir.app/Contents/MacOS/YTIndir' --smoke-test
-          fi
-          python -c "import json, os; from pathlib import Path; p=Path(os.environ['YTINDIR_DATA_DIR']); assert json.loads((p/'bundle-check.json').read_text())['frozen']; assert json.loads((p/'smoke.json').read_text())['frozen']; assert (p/'preview.png').is_file()"
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          executable = Path("dist/YTIndir.exe" if os.name == "nt" else
+                            "dist/YT İndir.app/Contents/MacOS/YTIndir").resolve()
+          if not executable.is_file():
+              raise FileNotFoundError(f"Packaged app missing: {executable}")
+          root = Path(os.environ["YTINDIR_DATA_DIR"])
+          root.mkdir(parents=True, exist_ok=True)
+          for name in ("bundle-check.json", "smoke.json", "preview.png"):
+              (root / name).unlink(missing_ok=True)
+          for option in ("--check-bundle", "--smoke-test"):
+              print(f"Running: {executable} {option}", flush=True)
+              result = subprocess.run([str(executable), option], timeout=120,
+                                      capture_output=True, text=True, errors="replace")
+              print(result.stdout, flush=True)
+              print(result.stderr, flush=True)
+              print(f"Exit code: {result.returncode} (0x{result.returncode & 0xffffffff:08X})", flush=True)
+              if result.returncode:
+                  raise RuntimeError(f"Packaged app failed: {option}; see output above")
+          for name in ("bundle-check.json", "smoke.json"):
+              path = root / name
+              if not path.is_file():
+                  raise RuntimeError(f"App exited without producing {path}")
+              report = json.loads(path.read_text(encoding="utf-8"))
+              print(f"{name}: {report}", flush=True)
+              assert report["frozen"], f"Check did not run the packaged app: {name}"
+          assert (root / "preview.png").is_file(), "GUI screenshot missing"
       - name: Archive macOS app preserving permissions and links
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent 'dist/YT İndir.app' dist/YTIndir-${{ matrix.platform }}.zip

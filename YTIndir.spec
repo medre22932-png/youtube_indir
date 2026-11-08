@@ -22,7 +22,8 @@ pyz = PYZ(analysis.pure)
 if sys.platform == 'win32':
     # One executable contains Python, Qt, cryptography, FFmpeg and ffprobe.
     exe = EXE(pyz, analysis.scripts, analysis.binaries, analysis.datas,
-              name='YTIndir', console=False, debug=False, strip=False, upx=False)
+              name='YTIndir', console=True, hide_console='hide-early',
+              debug=False, strip=False, upx=False)
 else:
     exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name='YTIndir',
               console=False, debug=False, strip=False, upx=False)

@@ -102,11 +102,41 @@ class Job:
     progress: int = 0
     output: str = ""
     error: str = ""
+    start_time: float | None = None
+    end_time: float | None = None
 
+
+def parse_timestamp(value: str) -> float:
+    """Accept seconds, MM:SS or HH:MM:SS, including fractional seconds."""
+    value = value.strip()
+    if not re.fullmatch(r"\d+(?::\d{1,2}){0,2}(?:\.\d{1,3})?", value):
+        raise ValueError("Zamanı saniye, DD:SS veya SS:DD:SS olarak girin. Örnek: 01:30")
+    parts = value.split(":")
+    if len(parts) > 1 and any(float(part) >= 60 for part in parts[1:]):
+        raise ValueError("Dakika ve saniye alanları 60'tan küçük olmalı.")
+    total = 0.0
+    for part in parts:
+        total = total * 60 + float(part)
+    return total
+
+
+def timestamp_seconds(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def clip_bounds(start: str, end: str) -> tuple[float, float]:
+    beginning, ending = parse_timestamp(start), parse_timestamp(end)
+    if ending <= beginning:
+        raise ValueError("Bitiş zamanı başlangıç zamanından sonra olmalı.")
+    return beginning, ending
+
+
+
+ACTIVE_STATUSES = {"İndiriliyor", "Dönüştürülüyor", "Bilgiler alınıyor", "Doğrulanıyor"}
 
 def save_jobs(path: Path, jobs: list[Job]) -> None:
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps([asdict(j) for j in jobs], ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.write_text(json.dumps([asdict(j) for j in jobs if j.status == "Bekliyor" or j.status in ACTIVE_STATUSES], ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -114,9 +144,10 @@ def load_jobs(path: Path) -> list[Job]:
     if not path.exists():
         return []
     jobs = [Job(**j) for j in json.loads(path.read_text(encoding="utf-8"))]
+    jobs = [job for job in jobs if job.status == "Bekliyor" or job.status in ACTIVE_STATUSES]
     for job in jobs:
-        if job.status in ("İndiriliyor", "Dönüştürülüyor", "Bilgiler alınıyor", "Doğrulanıyor"):
-            job.status, job.progress = "Bekliyor", 0
+        if job.status in ACTIVE_STATUSES:
+            job.status, job.progress, job.error, job.output = "Bekliyor", 0, "", ""
     return jobs
 
 
@@ -131,7 +162,17 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path) -> list[str]:
             "--print", "before_dl:__TITLE__%(title)j", "--print", "after_move:__FILE__%(filepath)j",
             "--no-simulate", "-P", job.folder]
     # Quality is part of the name so changing it cannot silently reuse another output.
-    template = f"%(title).140B [%(id)s] [{job.format}-{job.quality}].%(ext)s"
+    section = ""
+    if job.start_time is not None or job.end_time is not None:
+        if (job.start_time is None or job.end_time is None
+                or not 0 <= job.start_time < job.end_time < float("inf")):
+            raise ValueError("Geçersiz kesit aralığı.")
+        section = f" [{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}s]"
+        args += ["--download-sections", f"*{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}",
+                 "--downloader", "ffmpeg"]
+        if job.format == "MP4":
+            args += ["--force-keyframes-at-cuts"]
+    template = f"%(title).140B [%(id)s] [{job.format}-{job.quality}]{section}.%(ext)s"
     args += ["-o", template]
     if job.format == "MP3":
         args += ["-f", "bestaudio/best", "-x", "--audio-format", "mp3",
@@ -388,7 +429,7 @@ from pathlib import Path
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QMenu, QScrollArea, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -438,6 +479,7 @@ class Window(QMainWindow):
         self.probe: QProcess | None = None
         self.current: Job | None = None
         self.running = False
+        self.closing = False
         self.stop_after = False
         self.cancelled = False
         self.pending_start = False
@@ -485,7 +527,7 @@ class Window(QMainWindow):
 
         self.format = QComboBox()
         self.format.addItems(["MP4", "MP3"])
-        self.format.setCurrentText(self.settings.value("format", "MP4"))
+        self.format.setCurrentText("MP3")
         self.format.hide()
         formats = QHBoxLayout()
         self.video_button = QPushButton("Video · MP4")
@@ -512,6 +554,29 @@ class Window(QMainWindow):
         browse.clicked.connect(self.choose_folder)
         folder_row.addWidget(browse)
         layout.addLayout(folder_row)
+
+        self.clip_enabled = QCheckBox("Yalnızca belirli bir bölümü indir")
+        layout.addWidget(self.clip_enabled)
+        self.clip_options = QWidget()
+        clip_layout = QVBoxLayout(self.clip_options)
+        clip_layout.setContentsMargins(0, 0, 0, 0)
+        times = QHBoxLayout()
+        times.addWidget(QLabel("Başlangıç"))
+        self.clip_start = QLineEdit("00:00")
+        self.clip_start.setAccessibleName("Kesit başlangıcı")
+        times.addWidget(self.clip_start, 1)
+        times.addWidget(QLabel("Bitiş"))
+        self.clip_end = QLineEdit()
+        self.clip_end.setPlaceholderText("Örnek: 01:30")
+        self.clip_end.setAccessibleName("Kesit bitişi")
+        times.addWidget(self.clip_end, 1)
+        clip_layout.addLayout(times)
+        clip_help = QLabel("Örnek: 01:00 → 01:30, yalnızca bu 30 saniyeyi indirir.", objectName="subheading")
+        clip_help.setWordWrap(True)
+        clip_layout.addWidget(clip_help)
+        self.clip_options.hide()
+        self.clip_enabled.toggled.connect(self.clip_options.setVisible)
+        layout.addWidget(self.clip_options)
 
         options_button = QPushButton("Kalite ve ayarlar ▸")
         options_button.setCheckable(True)
@@ -558,10 +623,10 @@ class Window(QMainWindow):
 
         self.queue_label = QLabel("İndirmeler", objectName="subheading")
         layout.addWidget(self.queue_label)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Video", "Biçim", "Durum"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Başlık", "Biçim", "Durum", ""])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2):
+        for column in (1, 2, 3):
             self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -584,6 +649,11 @@ class Window(QMainWindow):
         scroll.setWidget(root)
         self.setCentralWidget(scroll)
         self.setStyleSheet(STYLE + """
+QCheckBox { spacing: 9px; }
+QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #ffffff; border-radius: 3px; }
+QCheckBox::indicator:unchecked { background: #ffffff; }
+QCheckBox::indicator:checked { background: #3977e8; }
+QCheckBox::indicator:hover { border-color: #9cc0ff; }
 QPushButton:checked { background: #243f65; border: 2px solid #6b9df7; color: #ffffff; }
 QMenu { background: #1a2332; color: #e6edf7; border: 1px solid #344258; padding: 6px; }
 QMenu::item { padding: 9px 18px; }
@@ -654,15 +724,26 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         for row, job in enumerate(self.jobs):
             quality = "En iyi" if job.quality == "best" else job.quality + (" kbps" if job.format == "MP3" else "p")
             title = job.url if job.title == "Bağlantı bilgisi bekleniyor" else job.title
+            if job.start_time is not None:
+                title += f" [{timestamp_seconds(job.start_time)}–{timestamp_seconds(job.end_time)} sn]"
             state = f"{job.status} · %{job.progress}" if job.status == "İndiriliyor" else job.status
             for col, value in enumerate((title, f"{job.format} · {quality}", state)):
                 item = QTableWidgetItem(value)
                 item.setToolTip(job.error or job.output or job.url)
                 self.table.setItem(row, col, item)
+            remove = QPushButton("Kaldır")
+            remove.setAccessibleName(f"Listeden kaldır: {title}")
+            busy = job is self.current or job.status in ACTIVE_STATUSES
+            remove.setEnabled(not busy)
+            remove.setToolTip("İşlem sürerken kaldırılamaz." if busy else "Listeden kaldır; indirilen dosya silinmez.")
+            remove.clicked.connect(lambda checked=False, job_id=job.id: self.remove_job(job_id))
+            self.table.setCellWidget(row, 3, remove)
 
     def add_links(self):
         try:
             links = parse_links(self.links.toPlainText())
+            start_time, end_time = (clip_bounds(self.clip_start.text(), self.clip_end.text())
+                                    if self.clip_enabled.isChecked() else (None, None))
             folder = str(Path(self.folder.text().strip()).expanduser().resolve())
             if not self.folder.text().strip():
                 raise ValueError("Bir kayıt klasörü seçin.")
@@ -670,7 +751,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             QMessageBox.warning(self, "Bağlantıları kontrol edin", str(error))
             return False
         for url in links:
-            self.jobs.append(Job(url, self.format.currentText(), self.quality.currentData(), folder))
+            self.jobs.append(Job(url, self.format.currentText(), self.quality.currentData(), folder,
+                                 start_time=start_time, end_time=end_time))
         self.links.clear()
         self.settings.setValue("folder", folder)
         self.settings.setValue("format", self.format.currentText())
@@ -679,6 +761,14 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.refresh_table()
         self.status.setText(f"{len(links)} bağlantı sıraya eklendi.")
         return True
+
+    def remove_job(self, job_id: str):
+        job = next((job for job in self.jobs if job.id == job_id), None)
+        if job is None or job is self.current or job.status in ACTIVE_STATUSES:
+            return
+        self.jobs.remove(job)
+        self.persist()
+        self.refresh_table()
 
     def retry_failed(self):
         for job in self.jobs:
@@ -784,6 +874,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.check_updates()
 
     def next_job(self):
+        if self.closing:
+            return
         if self.stop_after:
             self.finish_batch("İndirme sırası durduruldu.")
             return
@@ -928,10 +1020,13 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         job = self.current
         if not job:
             return
-        job.status = "Tamamlandı" if success else "İptal edildi" if self.cancelled else "Başarısız"
-        job.error = error
-        if success:
-            job.progress = 100
+        if self.closing:
+            job.status, job.progress, job.error, job.output = "Bekliyor", 0, "", ""
+        else:
+            job.status = "Tamamlandı" if success else "İptal edildi" if self.cancelled else "Başarısız"
+            job.error = error
+            if success:
+                job.progress = 100
         self.log(f"{job.status}: {job.title}")
         if error:
             self.log(error)
@@ -984,21 +1079,19 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             QMessageBox.information(self, "Güncelleme sürüyor", "Güncelleme denetimi bitince pencereyi kapatabilirsiniz.")
             event.ignore()
             return
-        if self.current:
-            box = QMessageBox(QMessageBox.Icon.Question, "İndirme devam ediyor",
-                              "Geçerli işlemi iptal edip uygulamayı kapatmak istiyor musunuz?", parent=self)
-            close = box.addButton("İptal et ve kapat", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("İndirmeye devam et", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is not close:
-                event.ignore()
-                return
-            self.stop_after = True
+        self.closing = True
+        self.stop_after = True
+        self.running = False
+        interrupted = self.current
+        if interrupted:
             self.cancel_current()
             if self.process:
                 self.process.waitForFinished(3000)
             if self.probe:
                 self.probe.waitForFinished(3000)
+            interrupted.status, interrupted.progress = "Bekliyor", 0
+            interrupted.error, interrupted.output = "", ""
+        self.current = None
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("folder", self.folder.text())
         self.settings.setValue("format", self.format.currentText())

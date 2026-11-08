@@ -13,7 +13,13 @@ Download from this repository's **Releases → latest** page:
 
 Python, Qt, FFmpeg, ffprobe and Python package dependencies are included by GitHub Actions. Users do not compile packages, install Python, use pip or install FFmpeg. The first launch needs internet access for the official yt-dlp nightly executable and Deno. macOS builds are currently unsigned and unnotarized.
 
-Paste YouTube links, choose Video (MP4) or Audio (MP3), and click **İndir**. The save folder is remembered. Optional quality controls are under **Kalite ve ayarlar**; update, retry, cleanup and diagnostic actions are in **Diğer**. The download list appears when videos are added. Downloads run sequentially with conversion and ffprobe validation before advancing. The app supports stopping after the current item, cancellation, retrying failures and restoring the queue. Only individual videos are downloaded.
+Paste YouTube links, choose Audio (MP3, the startup default) or Video (MP4), and click **İndir**. The save folder is remembered. Optional quality controls are under **Kalite ve ayarlar**; update, retry, cleanup and diagnostic actions are in **Diğer**. The download list appears when videos are added. Downloads run sequentially with conversion and ffprobe validation before advancing. Each row has a **Kaldır** button, disabled while that item is being processed; removing a row does not delete its downloaded file. The app supports stopping after the current item, cancellation and retrying failures. Closing stops the active download and returns it to the queue. Only waiting and interrupted items are restored on reopening; completed, failed and cancelled items are session history and are not restored. Only individual videos are downloaded.
+
+## Download a section
+
+Enable **Yalnızca belirli bir bölümü indir** and enter a start and end time, for example `01:00` to `01:30`. Times accept seconds, `MM:SS`, or `HH:MM:SS`, including milliseconds. This works for both MP4 and MP3. The same interval applies to all links added together; each queued item saves its own interval. Disable the option to download the full video again.
+
+The app uses yt-dlp's `--download-sections` with the FFmpeg downloader to seek in the remote media and retrieve the requested section, rather than downloading a full file and trimming it locally. Servers and stream formats may require extra headers, index data or nearby segments; exact network usage depends on the source. MP4 sections are re-encoded for accurate cut boundaries. MP3 sections use the selected audio bitrate. Output names include the interval so clips cannot collide with full downloads or other intervals.
 
 ## Saved settings and updates
 
@@ -33,7 +39,7 @@ FFmpeg and the Python/Qt packages are updated by rebuilding the app on GitHub. *
 
 ## GitHub builds
 
-`.github/workflows/build.yml` runs when application/build files change on `main`, or by manual dispatch. No version tag is required. Separate native runners build Windows x64 and Apple Silicon (macOS ARM64) packages, then check each packaged GUI and embedded FFmpeg/ffprobe.
+`.github/workflows/build.yml` runs when application/build files change on `main`, or by manual dispatch. No version tag is required. Separate native runners build Windows x64 and Apple Silicon (macOS ARM64) packages, then check each packaged GUI and embedded FFmpeg/ffprobe. Checks launch the packaged app through Python with timeouts and captured output, so failures report the actual test and native exit code. On Windows, the console hides on a normal double-click launch while CI retains diagnostic output.
 
 Like the translation project, each runner uploads directly to the `latest` GitHub Release. The workflow never uploads or downloads Actions build artifacts; its preparation step removes artifacts left by previous workflows. Python dependency caching remains enabled.
 
