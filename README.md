@@ -1,8 +1,8 @@
 # YT İndir
 
 Single-file Turkish YouTube MP3/MP4 desktop application for https://github.com/medre22932-png/youtube_indir.
-All application code and the pinned yt-dlp verification key are in `main.py`.
-Tests, build configuration and optional diagnostic scripts are development files.
+All application code and the pinned yt-dlp verification key are in `youtube_indir.py`.
+The remaining supporting files are needed for dependency installation, GitHub builds, or documentation.
 
 ## Download and use
 
@@ -34,7 +34,7 @@ FFmpeg and the Python/Qt packages are updated by rebuilding the app on GitHub. *
 
 ## GitHub builds
 
-`.github/workflows/build.yml` runs on pushes to `main`, pull requests, version tags and manual dispatch. Separate native runners build Windows x64, macOS ARM64 and macOS Intel packages. The workflow installs dependencies and FFmpeg on GitHub, tests the source, packages the app with PyInstaller and checks the packaged GUI and embedded FFmpeg/ffprobe. All three archives must build successfully before a `v*` tag publishes a release with SHA-256 checksums. Push a version tag such as `v1.0.0` to publish; regular pushes only create workflow artifacts.
+`.github/workflows/build.yml` runs on pushes to `main`, pull requests, version tags and manual dispatch. Separate native runners build Windows x64, macOS ARM64 and macOS Intel packages. The workflow installs dependencies and FFmpeg on GitHub, checks the source, packages the app with PyInstaller and checks the packaged GUI and embedded FFmpeg/ffprobe. All three archives must build successfully before a `v*` tag publishes a release with SHA-256 checksums. Push a version tag such as `v1.0.0` to publish; regular pushes only create workflow artifacts.
 
 macOS signing/notarization is not configured. Include licenses and corresponding-source access for redistributed FFmpeg and other bundled libraries before public binary distribution.
 
@@ -43,17 +43,24 @@ macOS signing/notarization is not configured. Include licenses and corresponding
 Python 3.11+ and FFmpeg/ffprobe are needed only for source development:
 
 ```sh
-python -m pip install -r requirements-dev.txt
-python main.py
-python -m pytest -q
+python -m pip install -r requirements.txt
+python youtube_indir.py
 ```
 
-The application source can be copied as one `main.py`; no `downloader` package, key file or resource folder is required. Source runs can also use FFmpeg/ffprobe placed in the saved folder's `tools/` directory. Build binaries through GitHub Actions.
+The application source can be copied as one `youtube_indir.py`; no `downloader` package, key file or resource folder is required. Source runs can also use FFmpeg/ffprobe placed in the saved folder's `tools/` directory. Build binaries through GitHub Actions.
 
 ```sh
-QT_QPA_PLATFORM=offscreen YTINDIR_DATA_DIR=/tmp/ytindir-preview python main.py --smoke-test
-YTINDIR_DATA_DIR=/tmp/ytindir-check python main.py --check-bundle
-python tools/check_engine.py /tmp/ytindir-engine-test
+QT_QPA_PLATFORM=offscreen YTINDIR_DATA_DIR=/tmp/ytindir-preview python youtube_indir.py --smoke-test
+YTINDIR_DATA_DIR=/tmp/ytindir-check python youtube_indir.py --check-bundle
 ```
 
-The engine check uses the network; GUI smoke and bundle checks do not. Windows and Mac package compatibility is checked by the workflow; a local source test alone does not establish cross-platform binary compatibility.
+GUI smoke and bundle checks do not use the network. Windows and Mac package compatibility is checked by the workflow; a local source test alone does not establish cross-platform binary compatibility.
+
+## Minimal project files
+
+- `youtube_indir.py`: complete application; no other project Python file is needed.
+- `requirements.txt`: third-party dependencies for running the source.
+- `YTIndir.spec` and `.github/workflows/build.yml`: Windows/macOS packaging on GitHub.
+- `README.md` and `.gitignore`: documentation and repository housekeeping.
+
+The Python file still needs its third-party packages and FFmpeg/ffprobe when run from source. GitHub-built EXE/app packages include these dependencies. A local `.venv/`, if present, is retained so source runs continue working; it is excluded from Git.

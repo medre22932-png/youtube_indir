@@ -27,7 +27,7 @@ jobs:
           python-version: '3.12'
           cache: pip
       - name: Install Python packages on GitHub
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements.txt "pyinstaller>=6.11"
       - name: Install FFmpeg on macOS runner
         if: runner.os == 'macOS'
         run: brew install ffmpeg
@@ -39,8 +39,8 @@ jobs:
           $binary = Get-ChildItem 'C:\ProgramData\chocolatey\lib\ffmpeg' -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           if (-not $binary) { throw 'FFmpeg installation missing' }
           $binary.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Test application
-        run: python -m pytest -q
+      - name: Check Python source
+        run: python -m py_compile youtube_indir.py
       - name: Package Python, Qt, FFmpeg and dependencies
         run: python -m PyInstaller --clean --noconfirm YTIndir.spec
       - name: Check packaged binaries and GUI
@@ -89,7 +89,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          cp main.py release/main.py
+          cp youtube_indir.py release/youtube_indir.py
           cd release
           sha256sum *.zip > SHA256SUMS
-          gh release create "$TAG" *.zip main.py SHA256SUMS --repo "$REPOSITORY" --verify-tag --generate-notes
+          gh release create "$TAG" *.zip youtube_indir.py SHA256SUMS --repo "$REPOSITORY" --verify-tag --generate-notes

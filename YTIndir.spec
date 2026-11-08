@@ -13,7 +13,7 @@ for tool in ('ffmpeg', 'ffprobe'):
     binaries.append((executable, 'resources/bin'))
 
 analysis = Analysis(
-    [str(root / 'main.py')], pathex=[str(root)], binaries=binaries, datas=[],
+    [str(root / 'youtube_indir.py')], pathex=[str(root)], binaries=binaries, datas=[],
     hiddenimports=['pgpy', 'imghdr'],
     excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtQml',
               'PySide6.QtQuick', 'PySide6.QtPdf', 'tkinter'],
