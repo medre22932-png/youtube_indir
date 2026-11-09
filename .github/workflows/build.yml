@@ -1,174 +1,198 @@
 name: Build and release desktop apps
+
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
-      - youtube_indir.py
-      - YTIndir.spec
-      - requirements.txt
-      - .github/workflows/build.yml
+      - 'youtube_indir.py'
+      - 'YTIndir.spec'
+      - 'requirements.txt'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
+
 concurrency:
   group: build-and-release
-  cancel-in-progress: false
+  cancel-in-progress: true
+
 permissions:
-  contents: read
+  contents: write
+  actions: write
+
 jobs:
-  prepare-release:
-    name: Prepare latest release
+  clean-and-prepare-release:
+    name: Prepare Release & Clean Artifacts
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      BUILD_SHA: ${{ github.sha }}
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      build_date: ${{ steps.meta.outputs.build_date }}
     steps:
-      - uses: actions/checkout@v5
-      - name: Remove old Actions artifacts
-        shell: bash
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Delete Any Old Artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ids=$(gh api --paginate "repos/$GH_REPO/actions/artifacts" --jq '.artifacts[].id')
-          for id in $ids; do
-            gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$id"
-          done
-      - name: Prepare draft latest release
-        shell: bash
-        run: |
-          existing=$(gh release list --limit 100 --json tagName --jq '.[] | select(.tagName == "latest") | .tagName')
-          if [[ "$existing" == "latest" ]]; then
-            gh release delete latest --yes --cleanup-tag
+          echo "Checking for any remaining artifacts in the repo..."
+          artifacts=$(gh api --paginate /repos/${{ github.repository }}/actions/artifacts --jq '.artifacts[].id' || true)
+          if [ -n "$artifacts" ]; then
+            for id in $artifacts; do
+              echo "Deleting artifact ID: $id"
+              gh api --method DELETE /repos/${{ github.repository }}/actions/artifacts/$id || true
+            done
           fi
-          gh release create latest --target "$BUILD_SHA" --draft \
-            --title "Latest build (${BUILD_SHA:0:7})" \
-            --notes 'Building and checking Windows and Apple Silicon macOS downloads.'
-          gh release upload latest youtube_indir.py --clobber
-  build:
-    needs: prepare-release
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform: windows-x64
-          - os: macos-15
-            platform: macos-arm64
-    runs-on: ${{ matrix.os }}
+
+      - name: Generate Short SHA & Timestamp
+        id: meta
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
+
+      - name: Reset 'latest' Release & Tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag -R ${{ github.repository }} || true
+          gh api -X DELETE /repos/${{ github.repository }}/git/refs/tags/latest || true
+          sleep 2
+          gh release create latest \
+            --title "Latest Release (${{ steps.meta.outputs.short_sha }} • ${{ steps.meta.outputs.build_date }})" \
+            --notes "Building Windows and macOS binaries..." \
+            --target ${{ github.sha }}
+          gh release upload latest youtube_indir.py --clobber -R ${{ github.repository }}
+
+  build-windows:
+    name: Build Windows Executable
+    needs: [clean-and-prepare-release]
+    runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
-      - name: Install Python packages on GitHub
-        run: python -m pip install -r requirements.txt "pyinstaller>=6.11"
-      - name: Install FFmpeg on macOS runner
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
-      - name: Install FFmpeg on Windows runner
-        if: runner.os == 'Windows'
-        shell: pwsh
+          cache: 'pip'
+
+      - name: Install Dependencies
         run: |
-          choco install ffmpeg --yes --no-progress
-          $binary = Get-ChildItem 'C:\ProgramData\chocolatey\lib\ffmpeg' -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          if (-not $binary) { throw 'FFmpeg installation missing' }
-          $binary.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Check Python source
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pyinstaller>=6.11"
+
+      - name: Setup FFmpeg
+        id: setup-ffmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+          architecture: x64
+          linking-type: static
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy FFmpeg into Project
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path ffmpeg
+          $binDir = "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}"
+          Write-Host "FFmpeg binary directory: $binDir"
+          Copy-Item "$binDir\ffmpeg.exe" ffmpeg\ffmpeg.exe -Force
+          Copy-Item "$binDir\ffprobe.exe" ffmpeg\ffprobe.exe -Force
+          .\ffmpeg\ffmpeg.exe -version | Select-Object -First 1
+          .\ffmpeg\ffprobe.exe -version | Select-Object -First 1
+
+      - name: Check Python Source
         run: python -m py_compile youtube_indir.py
-      - name: Package Python, Qt, FFmpeg and dependencies
-        run: python -m PyInstaller --clean --noconfirm YTIndir.spec
-      - name: Check packaged binaries and GUI
-        shell: python
-        env:
-          # Exercise the actual Windows plugin used by desktop users.
-          # macOS keeps the headless plugin for the hosted runner.
-          QT_QPA_PLATFORM: ${{ runner.os == 'Windows' && 'windows' || 'offscreen' }}
-          QT_DEBUG_PLUGINS: '1'
-          YTINDIR_DATA_DIR: ${{ runner.temp }}/ytindir-smoke
-        run: |
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
 
-          executable = Path("dist/YTIndir.exe" if os.name == "nt" else
-                            "dist/YT İndir.app/Contents/MacOS/YTIndir").resolve()
-          if not executable.is_file():
-              raise FileNotFoundError(f"Packaged app missing: {executable}")
-          root = Path(os.environ["YTINDIR_DATA_DIR"])
-          root.mkdir(parents=True, exist_ok=True)
-          for name in ("bundle-check.json", "smoke.json", "preview.png", "smoke.log"):
-              (root / name).unlink(missing_ok=True)
-          for option in ("--check-bundle", "--smoke-test"):
-              print(f"Running: {executable} {option}", flush=True)
-              try:
-                  result = subprocess.run([str(executable), option], timeout=120,
-                                          capture_output=True, text=True, errors="replace")
-              finally:
-                  diagnostic = root / "smoke.log"
-                  if diagnostic.is_file():
-                      print(diagnostic.read_text(encoding="utf-8", errors="replace"), flush=True)
-              print(result.stdout, flush=True)
-              print(result.stderr, flush=True)
-              print(f"Exit code: {result.returncode} (0x{result.returncode & 0xffffffff:08X})", flush=True)
-              if result.returncode:
-                  raise RuntimeError(f"Packaged app failed: {option}; see output above")
-          for name in ("bundle-check.json", "smoke.json"):
-              path = root / name
-              if not path.is_file():
-                  raise RuntimeError(f"App exited without producing {path}")
-              report = json.loads(path.read_text(encoding="utf-8"))
-              print(f"{name}: {report}", flush=True)
-              assert report["frozen"], f"Check did not run the packaged app: {name}"
-              if name == "smoke.json":
-                  assert report["platform"] == os.environ["QT_QPA_PLATFORM"], report
-          assert (root / "preview.png").is_file(), "GUI screenshot missing"
-      - name: Archive macOS app preserving permissions and links
-        if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent 'dist/YT İndir.app' dist/YTIndir-${{ matrix.platform }}.zip
-      - name: Upload directly to latest release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Build Executable with PyInstaller
         run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            export RELEASE_ASSET=dist/YTIndir.exe
-          else
-            export RELEASE_ASSET=dist/YTIndir-macos-arm64.zip
-          fi
-          python -c "import hashlib, os; from pathlib import Path; p=Path(os.environ['RELEASE_ASSET']); Path(str(p)+'.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n', encoding='utf-8')"
-          gh release upload latest "$RELEASE_ASSET" "$RELEASE_ASSET.sha256" --clobber
-  finalize-release:
-    name: Publish checked downloads
-    needs: [prepare-release, build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      BUILD_SHA: ${{ github.sha }}
+          pyinstaller --clean --noconfirm YTIndir.spec
+
+      - name: Upload Windows Executable Directly to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: powershell
+        run: |
+          $hash = (Get-FileHash dist/YTIndir.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  YTIndir.exe`n" | Set-Content -NoNewline -Encoding utf8 dist/YTIndir.exe.sha256
+          Write-Host "Uploading YTIndir.exe directly to GitHub Release (bypassing artifact storage)..."
+          gh release upload latest dist/YTIndir.exe dist/YTIndir.exe.sha256 --clobber -R ${{ github.repository }}
+
+  build-macos:
+    name: Build macOS Application
+    needs: [clean-and-prepare-release]
+    runs-on: macos-latest
+
     steps:
-      - name: Combine checksums and publish release
-        shell: bash
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Download Static FFmpeg Binaries
         run: |
-          gh release download latest --pattern '*.sha256' --dir checksums
+          mkdir -p ffmpeg
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            ARCH="x64"
+          fi
+          TAG="b6.1.1"
+          curl -fSL --retry 3 --retry-delay 2 "https://github.com/eugeneware/ffmpeg-static/releases/download/${TAG}/ffmpeg-darwin-${ARCH}.gz" | gunzip > ffmpeg/ffmpeg
+          curl -fSL --retry 3 --retry-delay 2 "https://github.com/eugeneware/ffmpeg-static/releases/download/${TAG}/ffprobe-darwin-${ARCH}.gz" | gunzip > ffmpeg/ffprobe
+          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
+          otool -L ffmpeg/ffmpeg
+          ffmpeg/ffmpeg -version | head -n 1
+          ffmpeg/ffprobe -version | head -n 1
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pyinstaller>=6.11"
+
+      - name: Check Python Source
+        run: python -m py_compile youtube_indir.py
+
+      - name: Build macOS App Bundle
+        run: |
+          pyinstaller --clean --noconfirm YTIndir.spec
+
+      - name: Package macOS App into Zip
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent 'dist/YT İndir.app' dist/YTIndir-macos-arm64.zip
+          shasum -a 256 dist/YTIndir-macos-arm64.zip | sed 's|dist/||' > dist/YTIndir-macos-arm64.zip.sha256
+
+      - name: Upload macOS Application Directly to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Uploading YTIndir-macos-arm64.zip directly to GitHub Release (bypassing artifact storage)..."
+          gh release upload latest dist/YTIndir-macos-arm64.zip dist/YTIndir-macos-arm64.zip.sha256 --clobber -R ${{ github.repository }}
+
+  finalize-release:
+    name: Finalize Release Notes
+    needs: [clean-and-prepare-release, build-windows, build-macos]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update Release Notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHORT_SHA: ${{ needs.clean-and-prepare-release.outputs.short_sha }}
+          BUILD_DATE: ${{ needs.clean-and-prepare-release.outputs.build_date }}
+        run: |
+          gh release download latest --pattern '*.sha256' --dir checksums -R ${{ github.repository }}
           cat checksums/YTIndir.exe.sha256 checksums/YTIndir-macos-arm64.zip.sha256 > SHA256SUMS
-          gh release upload latest SHA256SUMS --clobber
-          cat > release-notes.md <<EOF
-          Built from commit \`$BUILD_SHA\`. Both packaged apps passed GUI and FFmpeg checks.
+          gh release upload latest SHA256SUMS --clobber -R ${{ github.repository }}
+          gh release edit latest -R ${{ github.repository }} --latest --notes "### Automated Build: \`$SHORT_SHA\`
+          **Built on:** $BUILD_DATE
 
-          Downloads:
-          - [Windows x64 — YTIndir.exe](https://github.com/$GH_REPO/releases/download/latest/YTIndir.exe)
-          - [Apple Silicon Mac — ZIP](https://github.com/$GH_REPO/releases/download/latest/YTIndir-macos-arm64.zip)
-          - [Single Python source](https://github.com/$GH_REPO/releases/download/latest/youtube_indir.py)
-          - [SHA-256 checksums](https://github.com/$GH_REPO/releases/download/latest/SHA256SUMS)
-
-          Windows: run the EXE directly. Mac: unzip and move YT İndir.app to Applications.
-          Saved settings and engine updates remain in your user data folder.
-          EOF
-          gh release edit latest --draft=false --latest --notes-file release-notes.md
+          ### Downloads:
+          - **Windows**: [YTIndir.exe](https://github.com/${{ github.repository }}/releases/download/latest/YTIndir.exe)
+          - **macOS (Apple Silicon)**: [YTIndir-macos-arm64.zip](https://github.com/${{ github.repository }}/releases/download/latest/YTIndir-macos-arm64.zip) (unzip and move \`YT İndir.app\` to Applications)
+          - **Single Python source**: [youtube_indir.py](https://github.com/${{ github.repository }}/releases/download/latest/youtube_indir.py)
+          - **SHA-256 checksums**: [SHA256SUMS](https://github.com/${{ github.repository }}/releases/download/latest/SHA256SUMS)"

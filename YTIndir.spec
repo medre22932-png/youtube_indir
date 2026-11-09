@@ -1,19 +1,23 @@
 # GitHub Actions builds this spec on each target OS.
-import os
 import shutil
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 
 root = Path(SPECPATH)
 binaries = []
 for tool in ('ffmpeg', 'ffprobe'):
-    executable = shutil.which(tool)
+    suffix = '.exe' if sys.platform == 'win32' else ''
+    bundled = root / 'ffmpeg' / f'{tool}{suffix}'
+    executable = str(bundled) if bundled.is_file() else shutil.which(tool)
     if not executable:
-        raise RuntimeError(f'{tool} must be installed on the GitHub build runner')
+        raise RuntimeError(f'{tool} must be placed in ./ffmpeg/ or installed on PATH')
     binaries.append((executable, 'resources/bin'))
 
+datas = collect_data_files('certifi')
+
 analysis = Analysis(
-    [str(root / 'youtube_indir.py')], pathex=[str(root)], binaries=binaries, datas=[],
+    [str(root / 'youtube_indir.py')], pathex=[str(root)], binaries=binaries, datas=datas,
     hiddenimports=['pgpy', 'imghdr'],
     excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtQml',
               'PySide6.QtQuick', 'PySide6.QtPdf', 'tkinter'],
@@ -22,7 +26,7 @@ pyz = PYZ(analysis.pure)
 if sys.platform == 'win32':
     # One executable contains Python, Qt, cryptography, FFmpeg and ffprobe.
     exe = EXE(pyz, analysis.scripts, analysis.binaries, analysis.datas,
-              name='YTIndir', console=True, hide_console='hide-early',
+              name='YTIndir', console=False,
               debug=False, strip=False, upx=False)
 else:
     exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name='YTIndir',
