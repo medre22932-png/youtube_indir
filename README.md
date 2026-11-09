@@ -41,6 +41,10 @@ FFmpeg and the Python/Qt packages are updated by rebuilding the app on GitHub. *
 
 `.github/workflows/build.yml` runs when application/build files change on `main`, or by manual dispatch. No version tag is required. Separate native runners build Windows x64 and Apple Silicon (macOS ARM64) packages, then check each packaged GUI and embedded FFmpeg/ffprobe. Checks launch the packaged app through Python with timeouts and captured output, so failures report the actual test and native exit code. On Windows, the console hides on a normal double-click launch while CI retains diagnostic output.
 
+The Windows GUI check uses Qt's native `windows` platform plugin; macOS CI uses `offscreen`. The smoke report records the active platform and CI verifies it. Smoke runs also write startup/capture/shutdown stages and native fault traces to `smoke.log` in the test data folder; CI prints this file even when the app fails or times out. Qt plugin diagnostics are enabled during packaged checks. A screenshot that cannot be saved fails the smoke test.
+
+The smoke capture timer belongs to the window and is disconnected after the event loop exits. The window's deferred deletion is then processed while `QApplication` is still alive, before releasing the application lock. This makes GUI teardown explicit for both source and packaged runs.
+
 Like the translation project, each runner uploads directly to the `latest` GitHub Release. The workflow never uploads or downloads Actions build artifacts; its preparation step removes artifacts left by previous workflows. Python dependency caching remains enabled.
 
 The workflow recreates `latest` as a draft, uploads `YTIndir.exe`, `YTIndir-macos-arm64.zip`, the single Python source and SHA-256 checksums, and publishes the release after both platform jobs succeed. A failed build leaves the new release as a draft. The previous `latest` release is replaced during preparation. Runs are serialized to prevent overlapping uploads. Local edits do not trigger GitHub builds until you push them.

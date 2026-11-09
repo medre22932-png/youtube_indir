@@ -1105,12 +1105,30 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QLockFile, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 
 
 def main() -> int:
+    smoke_test = "--smoke-test" in sys.argv
+
+    def smoke_stage(message):
+        if smoke_test:
+            with (application_data_dir() / "smoke.log").open("a", encoding="utf-8") as log:
+                log.write(message + "\n")
+
+    if smoke_test:
+        import faulthandler
+        application_data_dir().mkdir(parents=True, exist_ok=True)
+        # Keep the file alive through Qt teardown; native failures may bypass
+        # Python exceptions and the captured Windows console streams.
+        global _smoke_fault_log
+        diagnostic_path = application_data_dir() / "smoke.log"
+        diagnostic_path.write_text("", encoding="utf-8")
+        _smoke_fault_log = diagnostic_path.open("a", encoding="utf-8")
+        faulthandler.enable(file=_smoke_fault_log)
+        smoke_stage("Starting Qt application")
     if "--check-bundle" in sys.argv:
         root = application_data_dir()
         root.mkdir(parents=True, exist_ok=True)
@@ -1140,6 +1158,7 @@ def main() -> int:
         finally:
             updater.close()
     app = QApplication(sys.argv)
+    smoke_stage(f"Qt application ready; platform={app.platformName()}")
     app.setOrganizationName("YTIndir")
     app.setApplicationName("YTIndir")
     # Overrides are useful for portable installations and isolated smoke tests.
@@ -1149,17 +1168,46 @@ def main() -> int:
     if not lock.tryLock(100):
         QMessageBox.information(None, "YT İndir zaten açık", "Açık olan YT İndir penceresini kullanın.")
         return 1
-    window = Window(data_dir, auto_update="--smoke-test" not in sys.argv)
+    smoke_stage("Creating window")
+    window = Window(data_dir, auto_update=not smoke_test)
+    smoke_stage("Showing window")
     window.show()
-    if "--smoke-test" in sys.argv:
+    if smoke_test:
         def capture():
+            smoke_stage("Capturing window")
             image_path = data_dir / "preview.png"
-            window.grab().save(str(image_path))
+            if not window.grab().save(str(image_path)):
+                smoke_stage("Screenshot failed")
+                app.exit(1)
+                return
             (data_dir / "smoke.json").write_text(json.dumps({"frozen": bool(getattr(sys, "frozen", False)),
-                                                           "window": window.windowTitle(), "screenshot": str(image_path)}))
+                                                           "window": window.windowTitle(), "screenshot": str(image_path),
+                                                           "platform": app.platformName()}))
+            smoke_stage("Closing window")
             window.close()
-        QTimer.singleShot(500, capture)
-    return app.exec()
+        # Give the callback an explicit Qt owner and release it before deleting
+        # the window. A singleShot helper can retain the captured GUI objects
+        # until Python shutdown, after QApplication has started tearing down.
+        capture_timer = QTimer(window)
+        capture_timer.setSingleShot(True)
+        capture_timer.timeout.connect(capture)
+        capture_timer.start(500)
+    smoke_stage("Entering event loop")
+    try:
+        result = app.exec()
+        smoke_stage(f"Event loop finished; exit={result}")
+        return result
+    finally:
+        if smoke_test:
+            capture_timer.stop()
+            capture_timer.timeout.disconnect(capture)
+        # Destroy the widget tree while QApplication is still alive, rather
+        # than leaving Qt/Python ownership cycles to interpreter shutdown.
+        smoke_stage("Deleting window")
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        lock.unlock()
+        smoke_stage("Window deleted; application lock released")
 
 
 if __name__ == "__main__":

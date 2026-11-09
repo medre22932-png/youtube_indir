@@ -25,7 +25,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       BUILD_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Remove old Actions artifacts
         shell: bash
         run: |
@@ -58,8 +58,8 @@ jobs:
             platform: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
@@ -83,7 +83,10 @@ jobs:
       - name: Check packaged binaries and GUI
         shell: python
         env:
-          QT_QPA_PLATFORM: offscreen
+          # Exercise the actual Windows plugin used by desktop users.
+          # macOS keeps the headless plugin for the hosted runner.
+          QT_QPA_PLATFORM: ${{ runner.os == 'Windows' && 'windows' || 'offscreen' }}
+          QT_DEBUG_PLUGINS: '1'
           YTINDIR_DATA_DIR: ${{ runner.temp }}/ytindir-smoke
         run: |
           import json
@@ -97,12 +100,17 @@ jobs:
               raise FileNotFoundError(f"Packaged app missing: {executable}")
           root = Path(os.environ["YTINDIR_DATA_DIR"])
           root.mkdir(parents=True, exist_ok=True)
-          for name in ("bundle-check.json", "smoke.json", "preview.png"):
+          for name in ("bundle-check.json", "smoke.json", "preview.png", "smoke.log"):
               (root / name).unlink(missing_ok=True)
           for option in ("--check-bundle", "--smoke-test"):
               print(f"Running: {executable} {option}", flush=True)
-              result = subprocess.run([str(executable), option], timeout=120,
-                                      capture_output=True, text=True, errors="replace")
+              try:
+                  result = subprocess.run([str(executable), option], timeout=120,
+                                          capture_output=True, text=True, errors="replace")
+              finally:
+                  diagnostic = root / "smoke.log"
+                  if diagnostic.is_file():
+                      print(diagnostic.read_text(encoding="utf-8", errors="replace"), flush=True)
               print(result.stdout, flush=True)
               print(result.stderr, flush=True)
               print(f"Exit code: {result.returncode} (0x{result.returncode & 0xffffffff:08X})", flush=True)
@@ -115,6 +123,8 @@ jobs:
               report = json.loads(path.read_text(encoding="utf-8"))
               print(f"{name}: {report}", flush=True)
               assert report["frozen"], f"Check did not run the packaged app: {name}"
+              if name == "smoke.json":
+                  assert report["platform"] == os.environ["QT_QPA_PLATFORM"], report
           assert (root / "preview.png").is_file(), "GUI screenshot missing"
       - name: Archive macOS app preserving permissions and links
         if: runner.os == 'macOS'
