@@ -198,8 +198,7 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path |
             args += ["-x", "--audio-format", "mp3", "--audio-quality", f"{job.quality}K"]
     else:
         limit = "" if job.quality == "best" else f"[height<={int(job.quality)}]"
-        high_res = f"bv*[height>1080]{limit}[vcodec!^=av01]+ba/" if job.quality == "best" or int(job.quality) > 1080 else ""
-        args += ["-f", f"{high_res}bv*{limit}+ba/b{limit}",
+        args += ["-f", f"bv*{limit}+ba/b{limit}",
                  "-S", "res,vcodec:h264,acodec:m4a",
                  "--merge-output-format", "mp4", "--remux-video", "mp4"]
     return args + ["--", job.url]
