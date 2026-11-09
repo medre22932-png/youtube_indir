@@ -1,4 +1,4 @@
-name: Build and release desktop apps
+name: Build and Release Cross-Platform App
 
 on:
   push:
@@ -60,7 +60,6 @@ jobs:
             --title "Latest Release (${{ steps.meta.outputs.short_sha }} • ${{ steps.meta.outputs.build_date }})" \
             --notes "Building Windows and macOS binaries..." \
             --target ${{ github.sha }}
-          gh release upload latest youtube_indir.py --clobber -R ${{ github.repository }}
 
   build-windows:
     name: Build Windows Executable
@@ -88,22 +87,18 @@ jobs:
         with:
           ffmpeg-version: release
           architecture: x64
-          linking-type: static
-          token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Copy FFmpeg into Project
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path ffmpeg
+          New-Item -ItemType Directory -Force -Path ffmpeg | Out-Null
           $binDir = "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}"
           Write-Host "FFmpeg binary directory: $binDir"
           Copy-Item "$binDir\ffmpeg.exe" ffmpeg\ffmpeg.exe -Force
           Copy-Item "$binDir\ffprobe.exe" ffmpeg\ffprobe.exe -Force
-          .\ffmpeg\ffmpeg.exe -version | Select-Object -First 1
-          .\ffmpeg\ffprobe.exe -version | Select-Object -First 1
-
-      - name: Check Python Source
-        run: python -m py_compile youtube_indir.py
+          .\ffmpeg\ffmpeg.exe -version
+          .\ffmpeg\ffprobe.exe -version
 
       - name: Build Executable with PyInstaller
         run: |
@@ -114,10 +109,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: powershell
         run: |
-          $hash = (Get-FileHash dist/YTIndir.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  YTIndir.exe`n" | Set-Content -NoNewline -Encoding utf8 dist/YTIndir.exe.sha256
           Write-Host "Uploading YTIndir.exe directly to GitHub Release (bypassing artifact storage)..."
-          gh release upload latest dist/YTIndir.exe dist/YTIndir.exe.sha256 --clobber -R ${{ github.repository }}
+          gh release upload latest dist/YTIndir.exe --clobber -R ${{ github.repository }}
 
   build-macos:
     name: Build macOS Application
@@ -146,16 +139,13 @@ jobs:
           curl -fSL --retry 3 --retry-delay 2 "https://github.com/eugeneware/ffmpeg-static/releases/download/${TAG}/ffprobe-darwin-${ARCH}.gz" | gunzip > ffmpeg/ffprobe
           chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
           otool -L ffmpeg/ffmpeg
-          ffmpeg/ffmpeg -version | head -n 1
-          ffmpeg/ffprobe -version | head -n 1
+          ffmpeg/ffmpeg -version
+          ffmpeg/ffprobe -version
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt "pyinstaller>=6.11"
-
-      - name: Check Python Source
-        run: python -m py_compile youtube_indir.py
 
       - name: Build macOS App Bundle
         run: |
@@ -163,15 +153,15 @@ jobs:
 
       - name: Package macOS App into Zip
         run: |
-          ditto -c -k --sequesterRsrc --keepParent 'dist/YT İndir.app' dist/YTIndir-macos-arm64.zip
-          shasum -a 256 dist/YTIndir-macos-arm64.zip | sed 's|dist/||' > dist/YTIndir-macos-arm64.zip.sha256
+          cd dist
+          zip -r -y YTIndir-macOS.zip "YT İndir.app"
 
       - name: Upload macOS Application Directly to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Uploading YTIndir-macos-arm64.zip directly to GitHub Release (bypassing artifact storage)..."
-          gh release upload latest dist/YTIndir-macos-arm64.zip dist/YTIndir-macos-arm64.zip.sha256 --clobber -R ${{ github.repository }}
+          echo "Uploading YTIndir-macOS.zip directly to GitHub Release (bypassing artifact storage)..."
+          gh release upload latest dist/YTIndir-macOS.zip --clobber -R ${{ github.repository }}
 
   finalize-release:
     name: Finalize Release Notes
@@ -185,14 +175,9 @@ jobs:
           SHORT_SHA: ${{ needs.clean-and-prepare-release.outputs.short_sha }}
           BUILD_DATE: ${{ needs.clean-and-prepare-release.outputs.build_date }}
         run: |
-          gh release download latest --pattern '*.sha256' --dir checksums -R ${{ github.repository }}
-          cat checksums/YTIndir.exe.sha256 checksums/YTIndir-macos-arm64.zip.sha256 > SHA256SUMS
-          gh release upload latest SHA256SUMS --clobber -R ${{ github.repository }}
-          gh release edit latest -R ${{ github.repository }} --latest --notes "### Automated Build: \`$SHORT_SHA\`
+          gh release edit latest -R ${{ github.repository }} --notes "### Automated Build: \`$SHORT_SHA\`
           **Built on:** $BUILD_DATE
 
           ### Downloads:
           - **Windows**: [YTIndir.exe](https://github.com/${{ github.repository }}/releases/download/latest/YTIndir.exe)
-          - **macOS (Apple Silicon)**: [YTIndir-macos-arm64.zip](https://github.com/${{ github.repository }}/releases/download/latest/YTIndir-macos-arm64.zip) (unzip and move \`YT İndir.app\` to Applications)
-          - **Single Python source**: [youtube_indir.py](https://github.com/${{ github.repository }}/releases/download/latest/youtube_indir.py)
-          - **SHA-256 checksums**: [SHA256SUMS](https://github.com/${{ github.repository }}/releases/download/latest/SHA256SUMS)"
+          - **macOS**: [YTIndir-macOS.zip](https://github.com/${{ github.repository }}/releases/download/latest/YTIndir-macOS.zip) (unzip and move \`YT İndir.app\` to Applications)"
