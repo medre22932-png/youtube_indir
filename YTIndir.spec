@@ -8,7 +8,7 @@ root = Path(SPECPATH)
 sys.path.insert(0, str(root))
 from youtube_indir import build_icon_file
 
-icon_file = str(build_icon_file(Path(WORKPATH) / 'icons'))
+icon_file = str(build_icon_file(root / 'build' / 'icons'))
 binaries = []
 for tool in ('ffmpeg', 'ffprobe'):
     suffix = '.exe' if sys.platform == 'win32' else ''

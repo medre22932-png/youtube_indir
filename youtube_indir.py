@@ -154,10 +154,27 @@ def load_jobs(path: Path) -> list[Job]:
     return jobs
 
 
+def video_output_stem(job: Job, title: str, video_id: str) -> str:
+    """Use a portable title-based name even when yt-dlp omits _filename."""
+    title = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", title).strip().rstrip(".")
+    title = title.encode("utf-8")[:140].decode("utf-8", "ignore").rstrip(" .") or "YouTube video"
+    if re.match(r"(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", title):
+        title = "_" + title
+    video_id = re.sub(r"[^\w-]", "_", video_id) or job.id
+    section = (f" [{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}s]"
+               if job.start_time is not None and job.end_time is not None else "")
+    return f"{title} [{video_id}] [{job.format}-{job.quality}]{section}"
+
+
 def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path | None = None) -> list[str]:
     args = ["--ignore-config", "--no-playlist", "--newline", "--no-colors", "--progress",
             "--encoding", "utf-8", "--socket-timeout", "20", "--retries", "3",
             "--fragment-retries", "3", "--extractor-retries", "3", "--continue",
+            # Parallelism applies to DASH/HLS fragments; parallel HTTP range workers
+            # handle direct streams with automatic fallback to yt-dlp chunked HTTP.
+            "--concurrent-fragments", "8", "--http-chunk-size", "10M",
+            "--retry-sleep", "http:exp=1:8", "--retry-sleep", "fragment:exp=1:8",
+            "--progress-delta", "0.5",
             "--no-overwrites", "--windows-filenames", "--ffmpeg-location", str(ffmpeg.parent),
             "--no-js-runtimes", "--js-runtimes", f"deno:{deno}",
             "--progress-template", "download:__PROGRESS__%(progress)j",
@@ -188,14 +205,110 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path |
     return args + ["--", job.url]
 
 
-def cut_arguments(job: Job, source: Path, output: Path) -> list[str]:
+CPU_H264_ARGS = ["-c:v", "libx264", "-preset", "superfast", "-crf", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]
+_ENCODER_CACHE: dict[str, list[tuple[str, list[str]]]] = {}
+
+
+def h264_encoder_candidates(system: str | None = None) -> list[tuple[str, list[str]]]:
+    """Ordered H.264 encoders for Adobe compatibility (GPU first, universal CPU fallback last)."""
+    system = system or sys.platform
+    candidates: list[tuple[str, list[str]]] = []
+    if system == "darwin":
+        candidates += [
+            ("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-b:v", "20M", "-allow_sw", "1", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+        ]
+    elif system == "win32" or system.startswith("linux"):
+        candidates += [
+            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "fast", "-qp", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_qsv", ["-c:v", "h264_qsv", "-global_quality", "20", "-pix_fmt", "nv12", "-tag:v", "avc1"]),
+            ("h264_amf", ["-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "20", "-qp_p", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+        ]
+        if system.startswith("linux"):
+            candidates.append(("h264_vaapi", ["-c:v", "h264_vaapi", "-qp", "20", "-tag:v", "avc1"]))
+    candidates.append(("libx264", list(CPU_H264_ARGS)))
+    return candidates
+
+
+def available_h264_encoders(ffmpeg: Path | None) -> list[tuple[str, list[str]]]:
+    """Probe and cache working 4K-capable H.264 encoders, always ending with CPU libx264 fallback."""
+    fallback = ("libx264", list(CPU_H264_ARGS))
+    if not ffmpeg or not ffmpeg.is_file():
+        return [fallback]
+    key = str(ffmpeg.resolve())
+    if key in _ENCODER_CACHE:
+        return list(_ENCODER_CACHE[key])
+    working: list[tuple[str, list[str]]] = []
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    for name, encoder_args in h264_encoder_candidates():
+        if name == "libx264":
+            continue
+        cmd = [
+            str(ffmpeg), "-hide_banner", "-nostdin", "-v", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=3840x2160:r=30:d=0.04",
+            "-frames:v", "1", *encoder_args, "-f", "null", "-",
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, timeout=5, env=child_environment(), **options)
+            if res.returncode == 0:
+                working.append((name, list(encoder_args)))
+                break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    working.append(fallback)
+    _ENCODER_CACHE[key] = working
+    return list(working)
+
+
+def probe_media_codecs(ffprobe: Path | None, source: Path) -> tuple[str, str]:
+    """Return (video_codec, audio_codec) in lowercase, or ('', '') if unavailable."""
+    if not ffprobe or not ffprobe.is_file() or not source.is_file():
+        return "", ""
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    try:
+        res = subprocess.run(
+            [str(ffprobe), "-v", "error", "-show_streams", "-of", "json", str(source)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, env=child_environment(), **options,
+        )
+        if res.returncode != 0:
+            return "", ""
+        streams = json.loads(res.stdout).get("streams", [])
+        vcodec = next((s.get("codec_name", "") for s in streams
+                       if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")), "")
+        acodec = next((s.get("codec_name", "") for s in streams if s.get("codec_type") == "audio"), "")
+        return vcodec.lower(), acodec.lower()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "", ""
+
+
+def transcode_arguments(video_input: str, audio_input: str | None, output: Path,
+                        encoder_args: list[str] | None = None, *, copy_audio: bool = True) -> list[str]:
+    """Build FFmpeg arguments to produce an Adobe-compatible H.264 (avc1) + AAC MP4."""
+    v_args = list(encoder_args) if encoder_args else list(CPU_H264_ARGS)
+    a_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k"]
+    args = ["-hide_banner", "-y", "-threads", "0", "-i", video_input]
+    if audio_input:
+        args += ["-i", audio_input, "-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        args += ["-map", "0:v:0", "-map", "0:a:0?"]
+    args += [*v_args, *a_args, "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
+    return args
+
+
+def cut_arguments(job: Job, source: Path, output: Path,
+                  video_codec_args: list[str] | None = None, *, copy_audio: bool = True) -> list[str]:
     if job.start_time is None or job.end_time is None or not 0 <= job.start_time < job.end_time < float("inf"):
         raise ValueError("Geçersiz kesit aralığı.")
-    args = ["-hide_banner", "-nostdin", "-n", "-ss", timestamp_seconds(job.start_time),
+    args = ["-hide_banner", "-nostdin", "-y" if video_codec_args else "-n", "-ss", timestamp_seconds(job.start_time),
             "-i", str(source), "-t", timestamp_seconds(job.end_time - job.start_time),
             "-map_metadata", "0"]
     if job.format == "MP3":
         args += ["-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", f"{int(job.quality)}k"]
+    elif video_codec_args:
+        audio_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k"]
+        args += ["-map", "0:v:0", "-map", "0:a:0?", *video_codec_args, *audio_args, "-movflags", "+faststart"]
     else:
         args += ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy"]
     return args + ["-progress", "pipe:1", "-nostats", str(output)]
@@ -449,17 +562,23 @@ class StateManager:
         os.replace(temporary, self.path)
 
 
+import concurrent.futures
+from contextlib import ExitStack
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
+from requests.adapters import HTTPAdapter
 
 from PySide6.QtCore import (
-    QBuffer, QByteArray, QEasingCurve, QIODevice, QPointF, QPropertyAnimation,
-    QProcess, QProcessEnvironment, QRectF, Qt, QTimer, QUrl,
+    QBuffer, QByteArray, QEasingCurve, QIODevice, QObject, QPointF, QPropertyAnimation,
+    QProcess, QProcessEnvironment, QRectF, Qt, QThread, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor, QDesktopServices, QIcon, QImage, QLinearGradient, QPainter,
@@ -639,6 +758,681 @@ QProgressBar::chunk { background: #3977e8; border-radius: 5px; }
 """
 
 
+PARALLEL_CONNECTIONS = 8
+RANGE_CHUNK_SIZE = 4 * 1024 * 1024
+MAX_IN_FLIGHT_CHUNKS = 12
+
+
+def validate_range_response(response, start: int, end: int, total: int | None = None) -> int:
+    """Reject ignored ranges, wrong offsets, changed sizes and compressed bodies."""
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+    if response.status_code != 206 or not match:
+        raise ValueError("Sunucu istenen HTTP aralığını döndürmedi.")
+    first, last, size = map(int, match.groups())
+    if (first != start or last != end or size <= end or (total is not None and size != total)
+            or response.headers.get("Content-Encoding", "identity").lower() != "identity"):
+        raise ValueError("HTTP parça aralığı veya dosya boyutu değişti.")
+    length = response.headers.get("Content-Length")
+    if length is not None and int(length) != end - start + 1:
+        raise ValueError("HTTP parça uzunluğu geçersiz.")
+    return size
+
+
+class FastDownloadProcess(QObject):
+    """QProcess-compatible pipeline: 8x parallel HTTP range download + on-the-fly H.264 transcoding + fallbacks."""
+
+    readyReadStandardOutput = Signal()
+    finished = Signal(int, object)
+    errorOccurred = Signal(object)
+
+    def __init__(self, job: Job, engine: Path, args: list[str], ffmpeg: Path | None,
+                 ffprobe: Path | None, deno: Path | None, workspace: Path, parent=None):
+        super().__init__(parent)
+        self.job = job
+        self.engine = engine
+        self.args = list(args)
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
+        self.deno = deno
+        self.workspace = workspace
+        self._buffer = bytearray()
+        self._buffer_lock = threading.Lock()
+        self._proc_lock = threading.Lock()
+        self._children: list[subprocess.Popen] = []
+        self._cancelled = False
+        self._cancel_event = threading.Event()
+        self._running = False
+        self._error_string = ""
+        self._captured_file = ""
+        self._thread = QThread(self)
+        self._thread.run = self._run_pipeline
+        self._thread.finished.connect(self._on_thread_finished)
+        self._exit_code = 1
+
+    def start(self):
+        if not self.engine or not self.engine.is_file():
+            self._error_string = f"İndirme motoru bulunamadı: {self.engine}"
+            QTimer.singleShot(0, lambda: self.errorOccurred.emit(QProcess.ProcessError.FailedToStart))
+            return
+        self._running = True
+        self._thread.start()
+
+    def state(self) -> QProcess.ProcessState:
+        return QProcess.ProcessState.Running if self._running or self._thread.isRunning() else QProcess.ProcessState.NotRunning
+
+    def processId(self) -> int:
+        return 0
+
+    def errorString(self) -> str:
+        return self._error_string or "İşlem başlatılamadı."
+
+    def readAllStandardOutput(self) -> bytes:
+        with self._buffer_lock:
+            data = bytes(self._buffer)
+            self._buffer.clear()
+            return data
+
+    def _emit_line(self, line: str):
+        if line.startswith("__FILE__"):
+            try:
+                self._captured_file = json.loads(line[len("__FILE__"):])
+            except ValueError:
+                pass
+        with self._buffer_lock:
+            self._buffer.extend((line + "\n").encode("utf-8", "replace"))
+        self.readyReadStandardOutput.emit()
+
+    def _spawn_child(self, cmd: list[str], *, stdin=subprocess.DEVNULL) -> subprocess.Popen:
+        kwargs = {
+            "stdin": stdin,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "env": child_environment(),
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        with self._proc_lock:
+            if self._cancelled:
+                raise InterruptedError("Cancelled")
+            proc = subprocess.Popen(cmd, **kwargs)
+            self._children.append(proc)
+            return proc
+
+    def _kill_child(self, proc: subprocess.Popen):
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            proc.kill()
+        except OSError:
+            pass
+
+    def kill(self):
+        self._cancelled = True
+        self._cancel_event.set()
+        with self._proc_lock:
+            children = list(self._children)
+        for proc in children:
+            self._kill_child(proc)
+
+    def waitForFinished(self, msecs: int = 30000) -> bool:
+        return self._thread.wait(msecs)
+
+    def _on_thread_finished(self):
+        self._running = False
+        self.finished.emit(self._exit_code, QProcess.ExitStatus.NormalExit)
+
+    def _run_pipeline(self):
+        try:
+            self._run_download()
+        except Exception as error:
+            self._exit_code = 1
+            if not self._cancelled:
+                self._emit_line(f"İndirme tamamlanamadı: {error}")
+        finally:
+            self._stop_children()
+
+    def _stop_children(self):
+        with self._proc_lock:
+            children = list(self._children)
+        for proc in children:
+            self._kill_child(proc)
+            proc.wait()
+
+    def _run_download(self):
+        try:
+            if self._try_parallel_pipeline():
+                self._exit_code = 0
+                return
+        except InterruptedError:
+            self._exit_code = 1
+            return
+        except Exception as error:
+            if self._cancelled:
+                self._exit_code = 1
+                return
+            self._emit_line(f"Hızlı akış yedek motora geçiyor: {error}")
+
+        if not self._cancelled:
+            # A failed streaming encoder must not survive into the fallback.
+            self._stop_children()
+            self._exit_code = self._run_ytdlp_fallback()
+
+    def _extract_info(self) -> dict | None:
+        cmd = [
+            str(self.engine), "--ignore-config", "--no-playlist", "--no-warnings",
+            "--encoding", "utf-8", "--socket-timeout", "15", "--retries", "2",
+            "--windows-filenames", "-P", str(self.workspace),
+        ]
+        if self.ffmpeg:
+            cmd += ["--ffmpeg-location", str(self.ffmpeg.parent)]
+        if self.deno:
+            cmd += ["--no-js-runtimes", "--js-runtimes", f"deno:{self.deno}"]
+        for flag in ("-o", "-f", "-S"):
+            if flag in self.args:
+                idx = self.args.index(flag)
+                if idx + 1 < len(self.args):
+                    cmd += [flag, self.args[idx + 1]]
+        cmd += ["--dump-single-json", "--", self.job.url]
+        proc = self._spawn_child(cmd)
+        out, _ = proc.communicate()
+        if self._cancelled:
+            raise InterruptedError("Cancelled")
+        if proc.returncode != 0 or not out:
+            return None
+        lines = [line for line in out.decode("utf-8", "replace").splitlines() if line.strip().startswith("{")]
+        return json.loads(lines[-1]) if lines else None
+
+    def _probe_stream_range(self, session: requests.Session, stream: dict) -> int | None:
+        url = stream.get("url") or ""
+        protocol = (stream.get("protocol") or "").lower()
+        if not url.startswith(("http://", "https://")) or protocol not in ("https", "http") or stream.get("fragments"):
+            return None
+        headers = dict(stream.get("http_headers") or {})
+        headers["Range"] = "bytes=0-0"
+        headers["Accept-Encoding"] = "identity"
+        try:
+            with session.get(url, headers=headers, stream=True, timeout=(10, 15)) as resp:
+                return validate_range_response(resp, 0, 0)
+        except (requests.RequestException, ValueError):
+            return None
+
+    def _parallel_download_file(self, url: str, headers: dict, total_size: int, dest_path: Path,
+                                offset_bytes: int, total_all_bytes: int,
+                                pipe_stdin=None, *, stream_id: str | None = None) -> tuple[bool, bool]:
+        """Download via 8 concurrent HTTP range workers, writing ordered chunks to disk and optional FFmpeg pipe."""
+        num_chunks = max(1, (total_size + RANGE_CHUNK_SIZE - 1) // RANGE_CHUNK_SIZE)
+        # Signed URLs change on reconnect. Format identity and size must match
+        # before reusing the contiguous, validated prefix already on disk.
+        resume_path = dest_path.with_name(dest_path.name + ".resume.json")
+        identity = {"video": self.job.url, "stream": stream_id or url, "size": total_size}
+        resume_bytes = 0
+        try:
+            if json.loads(resume_path.read_text(encoding="utf-8")) == identity:
+                size = dest_path.stat().st_size
+                if size <= total_size:
+                    resume_bytes = size if size == total_size else size // RANGE_CHUNK_SIZE * RANGE_CHUNK_SIZE
+        except (OSError, ValueError):
+            pass
+        live_lock = threading.Lock()
+        live_bytes = [resume_bytes]
+        speed_window: deque[tuple[float, int]] = deque()
+        thread_local = threading.local()
+        sessions: list[requests.Session] = []
+
+        def get_session() -> requests.Session:
+            sess = getattr(thread_local, "session", None)
+            if sess is None:
+                sess = requests.Session()
+                sess.verify = certifi.where()
+                adapter = HTTPAdapter(pool_connections=PARALLEL_CONNECTIONS, pool_maxsize=PARALLEL_CONNECTIONS)
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+                thread_local.session = sess
+                with live_lock:
+                    sessions.append(sess)
+            return sess
+
+        def fetch_chunk(index: int) -> bytes:
+            start = index * RANGE_CHUNK_SIZE
+            end = min(total_size - 1, (index + 1) * RANGE_CHUNK_SIZE - 1)
+            expected = end - start + 1
+            req_headers = dict(headers)
+            req_headers["Range"] = f"bytes={start}-{end}"
+            req_headers["Accept-Encoding"] = "identity"
+            for attempt in range(4):
+                if self._cancelled:
+                    raise InterruptedError("Cancelled")
+                added = 0
+                try:
+                    with get_session().get(url, headers=req_headers, stream=True, timeout=(10, 20)) as resp:
+                        validate_range_response(resp, start, end, total_size)
+                        buf = bytearray()
+                        for block in resp.iter_content(64 * 1024):
+                            if self._cancelled:
+                                raise InterruptedError("Cancelled")
+                            if not block:
+                                continue
+                            if len(buf) + len(block) > expected:
+                                raise ValueError("HTTP parçası beklenen boyutu aşıyor.")
+                            buf.extend(block)
+                            added += len(block)
+                            with live_lock:
+                                live_bytes[0] += len(block)
+                        if len(buf) == expected:
+                            return bytes(buf)
+                        raise RuntimeError("Eksik parça boyutu")
+                except InterruptedError:
+                    raise
+                except Exception:
+                    with live_lock:
+                        live_bytes[0] = max(0, live_bytes[0] - added)
+                    if attempt == 3:
+                        raise
+                    if self._cancel_event.wait(0.4 * (2 ** attempt)):
+                        raise InterruptedError("Cancelled")
+            raise RuntimeError("Parça indirilemedi")
+
+        def emit_progress(finished: bool = False):
+            now = time.monotonic()
+            with live_lock:
+                current_dl = min(total_all_bytes, offset_bytes + live_bytes[0])
+            speed_window.append((now, current_dl))
+            while len(speed_window) > 1 and now - speed_window[0][0] > 3.0:
+                speed_window.popleft()
+            dt = now - speed_window[0][0] if len(speed_window) > 1 else 0.0
+            speed = (current_dl - speed_window[0][1]) / dt if dt >= 0.15 else None
+            remaining = max(0, total_all_bytes - current_dl)
+            eta = int(remaining / speed) if speed and speed > 0 else None
+            payload = {
+                "filename": "download",
+                "status": "finished" if finished else "downloading",
+                "downloaded_bytes": total_all_bytes if finished else current_dl,
+                "total_bytes": total_all_bytes,
+                "speed": speed,
+                "eta": 0 if finished else eta,
+            }
+            self._emit_line("__PROGRESS__" + json.dumps(payload))
+
+        pipe_ok = pipe_stdin is not None
+        def write_pipe(data: bytes):
+            nonlocal pipe_ok
+            if self._cancelled:
+                raise InterruptedError("Cancelled")
+            if pipe_ok:
+                try:
+                    pipe_stdin.write(data)
+                    pipe_stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pipe_ok = False
+                    try:
+                        pipe_stdin.close()
+                    except OSError:
+                        pass
+
+        in_flight: dict[int, concurrent.futures.Future[bytes]] = {}
+        first_chunk = (resume_bytes + RANGE_CHUNK_SIZE - 1) // RANGE_CHUNK_SIZE
+        next_submit = first_chunk
+        last_report = 0.0
+
+        with ExitStack() as stack:
+            # Close per-worker sessions after the executor has joined its workers.
+            def close_sessions():
+                for session in sessions:
+                    session.close()
+            stack.callback(close_sessions)
+            out_file = stack.enter_context(dest_path.open("r+b" if dest_path.exists() else "w+b"))
+            out_file.truncate(resume_bytes)
+            resume_path.write_text(json.dumps(identity), encoding="utf-8")
+            # FFmpeg's new pipe needs the existing prefix too, even though the
+            # network only needs to fetch the remaining ranges.
+            remaining_prefix = resume_bytes
+            while pipe_ok and remaining_prefix:
+                data = out_file.read(min(64 * 1024, remaining_prefix))
+                if not data:
+                    raise ValueError("Devam dosyası beklenenden kısa.")
+                write_pipe(data)
+                remaining_prefix -= len(data)
+            out_file.seek(resume_bytes)
+            pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_CONNECTIONS))
+            try:
+                for next_write in range(first_chunk, num_chunks):
+                    while (next_submit < num_chunks and len(in_flight) < PARALLEL_CONNECTIONS
+                           and (next_submit - next_write) < MAX_IN_FLIGHT_CHUNKS):
+                        in_flight[next_submit] = pool.submit(fetch_chunk, next_submit)
+                        next_submit += 1
+
+                    fut = in_flight[next_write]
+                    while True:
+                        if self._cancelled:
+                            raise InterruptedError("Cancelled")
+                        try:
+                            chunk_data = fut.result(timeout=0.2)
+                            break
+                        except concurrent.futures.TimeoutError:
+                            now = time.monotonic()
+                            if now - last_report >= 0.2:
+                                emit_progress(False)
+                                last_report = now
+
+                    del in_flight[next_write]
+                    while (next_submit < num_chunks and len(in_flight) < PARALLEL_CONNECTIONS
+                           and (next_submit - next_write) < MAX_IN_FLIGHT_CHUNKS):
+                        in_flight[next_submit] = pool.submit(fetch_chunk, next_submit)
+                        next_submit += 1
+
+                    out_file.write(chunk_data)
+                    out_file.flush()
+                    write_pipe(chunk_data)
+
+                    now = time.monotonic()
+                    if now - last_report >= 0.2:
+                        emit_progress(False)
+                        last_report = now
+            finally:
+                for fut in in_flight.values():
+                    fut.cancel()
+
+        return True, pipe_ok
+
+    def _run_ffmpeg_with_progress(self, cmd: list[str], *, forward_progress: bool = True) -> int:
+        proc = self._spawn_child(cmd)
+        assert proc.stdout is not None
+        for raw_line in iter(proc.stdout.readline, b""):
+            if self._cancelled:
+                self._kill_child(proc)
+                raise InterruptedError("Cancelled")
+            line = raw_line.decode("utf-8", "replace").strip()
+            if line and forward_progress:
+                self._emit_line(line)
+        return proc.wait()
+
+    def _transcode_local_mp4(self, video_path: Path, audio_path: Path | None,
+                             output_path: Path, *, copy_audio: bool) -> bool:
+        """Transcode local file to Adobe-compatible H.264 + AAC, trying GPU first then universal CPU fallback."""
+        if not self.ffmpeg:
+            return False
+        self._emit_line("__POST__{}")
+        encoders = available_h264_encoders(self.ffmpeg)
+        for name, enc_args in encoders:
+            if self._cancelled:
+                raise InterruptedError("Cancelled")
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+            cmd = [str(self.ffmpeg), *transcode_arguments(
+                str(video_path), str(audio_path) if audio_path else None,
+                output_path, enc_args, copy_audio=copy_audio,
+            )]
+            code = self._run_ffmpeg_with_progress(cmd, forward_progress=True)
+            if code == 0 and output_path.is_file() and output_path.stat().st_size > 0:
+                return True
+            self._emit_line(f"Donanım kodlayıcı ({name}) başarısız oldu; uyumlu CPU kodlayıcıya geçiliyor…")
+        return False
+
+    def _try_parallel_pipeline(self) -> bool:
+        if not self.ffmpeg or not self.ffmpeg.is_file():
+            return False
+        info = self._extract_info()
+        if not info or info.get("is_live"):
+            return False
+
+        title = info.get("title") or self.job.url
+        self._emit_line("__TITLE__" + json.dumps(title))
+        duration = info.get("duration")
+        if isinstance(duration, (int, float)) and duration > 0:
+            self._emit_line("__DURATION__" + json.dumps(duration))
+
+        raw_formats = info.get("requested_formats") or [info]
+        session = requests.Session()
+        session.verify = certifi.where()
+        try:
+            stream_sizes: list[int] = []
+            for fmt in raw_formats:
+                size = self._probe_stream_range(session, fmt)
+                if not size:
+                    return False
+                stream_sizes.append(size)
+        finally:
+            session.close()
+
+        total_all_bytes = sum(stream_sizes)
+        self._emit_line('__STREAMS__["download"]')
+
+        target_stem = video_output_stem(self.job, str(info.get("title") or "YouTube video"),
+                                        str(info.get("id") or self.job.id))
+        final_ext = "." + self.job.format.lower()
+        final_path = self.workspace / (target_stem + final_ext)
+
+        if self.job.format == "MP3":
+            fmt = raw_formats[0]
+            ext = "." + (fmt.get("ext") or "m4a").lstrip(".")
+            raw_audio = self.workspace / (f"{target_stem}{ext}" if self.job.start_time is not None
+                                          else f"raw_audio{ext}")
+            if self.job.start_time is None:
+                # On-the-fly MP3 encoding while parallel-downloading audio chunks.
+                mp3_cmd = [
+                    str(self.ffmpeg), "-hide_banner", "-y", "-i", "pipe:0",
+                    "-vn", "-c:a", "libmp3lame", "-b:a", f"{int(self.job.quality)}k",
+                    "-progress", "pipe:1", "-nostats", str(final_path),
+                ]
+                ff_proc = self._spawn_child(mp3_cmd, stdin=subprocess.PIPE)
+                download_done = threading.Event()
+
+                def drain_mp3():
+                    assert ff_proc.stdout is not None
+                    for raw in iter(ff_proc.stdout.readline, b""):
+                        if download_done.is_set():
+                            line = raw.decode("utf-8", "replace").strip()
+                            if line:
+                                self._emit_line(line)
+
+                reader = threading.Thread(target=drain_mp3, daemon=True)
+                reader.start()
+                _, pipe_ok = self._parallel_download_file(
+                    fmt["url"], fmt.get("http_headers") or {}, stream_sizes[0],
+                    raw_audio, 0, total_all_bytes, pipe_stdin=ff_proc.stdin,
+                    stream_id=fmt.get("format_id"),
+                )
+                download_done.set()
+                self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
+                                + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
+                if ff_proc.stdin:
+                    try:
+                        ff_proc.stdin.close()
+                    except OSError:
+                        pass
+                self._emit_line("__POST__{}")
+                code = ff_proc.wait()
+                reader.join(timeout=2.0)
+                if not pipe_ok or code != 0 or not final_path.is_file() or final_path.stat().st_size == 0:
+                    fallback_cmd = [
+                        str(self.ffmpeg), "-hide_banner", "-y", "-i", str(raw_audio),
+                        "-vn", "-c:a", "libmp3lame", "-b:a", f"{int(self.job.quality)}k",
+                        "-progress", "pipe:1", "-nostats", str(final_path),
+                    ]
+                    if self._run_ffmpeg_with_progress(fallback_cmd) != 0:
+                        return False
+                try:
+                    raw_audio.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._emit_line("__FILE__" + json.dumps(str(final_path)))
+                return True
+            else:
+                self._parallel_download_file(
+                    fmt["url"], fmt.get("http_headers") or {}, stream_sizes[0],
+                    raw_audio, 0, total_all_bytes,
+                    stream_id=fmt.get("format_id"),
+                )
+                self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
+                                + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
+                self._emit_line("__FILE__" + json.dumps(str(raw_audio)))
+                return True
+
+        # MP4 pipeline
+        video_fmt = raw_formats[0]
+        video_size = stream_sizes[0]
+        audio_fmt = raw_formats[1] if len(raw_formats) > 1 else None
+        audio_size = stream_sizes[1] if len(raw_formats) > 1 else 0
+
+        vcodec = (video_fmt.get("vcodec") or "").lower()
+        acodec = ((audio_fmt or video_fmt).get("acodec") or "").lower()
+        is_h264 = vcodec.startswith(("avc1", "h264"))
+        is_aac = acodec.startswith(("mp4a", "aac"))
+
+        raw_audio: Path | None = None
+        offset = 0
+        if audio_fmt is not None:
+            a_ext = "." + (audio_fmt.get("ext") or "m4a").lstrip(".")
+            raw_audio = self.workspace / f"raw_audio{a_ext}"
+            self._parallel_download_file(
+                audio_fmt["url"], audio_fmt.get("http_headers") or {}, audio_size,
+                raw_audio, 0, total_all_bytes,
+                stream_id=audio_fmt.get("format_id"),
+            )
+            offset = audio_size
+
+        v_ext = "." + (video_fmt.get("ext") or "webm").lstrip(".")
+        raw_video = self.workspace / f"raw_video{v_ext}"
+
+        if not is_h264 and self.job.start_time is None:
+            # >1080p VP9/AV1 full video: transcode on the fly while parallel-downloading video chunks!
+            encoders = available_h264_encoders(self.ffmpeg)
+            enc_name, enc_args = encoders[0]
+            self._emit_line(f"Adobe uyumlu H.264 anlık dönüştürme başlatıldı ({enc_name}).")
+            fly_cmd = [str(self.ffmpeg), *transcode_arguments(
+                "pipe:0", str(raw_audio) if raw_audio else None,
+                final_path, enc_args, copy_audio=is_aac,
+            )]
+            ff_proc = self._spawn_child(fly_cmd, stdin=subprocess.PIPE)
+            download_done = threading.Event()
+
+            def drain_video():
+                assert ff_proc.stdout is not None
+                for raw in iter(ff_proc.stdout.readline, b""):
+                    if download_done.is_set():
+                        line = raw.decode("utf-8", "replace").strip()
+                        if line:
+                            self._emit_line(line)
+
+            reader = threading.Thread(target=drain_video, daemon=True)
+            reader.start()
+            _, pipe_ok = self._parallel_download_file(
+                video_fmt["url"], video_fmt.get("http_headers") or {}, video_size,
+                raw_video, offset, total_all_bytes, pipe_stdin=ff_proc.stdin,
+                stream_id=video_fmt.get("format_id"),
+            )
+            download_done.set()
+            self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
+                            + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
+            if ff_proc.stdin:
+                try:
+                    ff_proc.stdin.close()
+                except OSError:
+                    pass
+            self._emit_line("__POST__{}")
+            code = ff_proc.wait()
+            reader.join(timeout=2.0)
+
+            if not pipe_ok or code != 0 or not final_path.is_file() or final_path.stat().st_size == 0:
+                if not self._transcode_local_mp4(raw_video, raw_audio, final_path, copy_audio=is_aac):
+                    return False
+
+            for temp_file in (raw_video, raw_audio):
+                if temp_file:
+                    try:
+                        temp_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            self._emit_line("__FILE__" + json.dumps(str(final_path)))
+            return True
+
+        # Either already H.264 (<=1080p) or a section clip (which will be cut/transcoded locally)
+        self._parallel_download_file(
+            video_fmt["url"], video_fmt.get("http_headers") or {}, video_size,
+            raw_video, offset, total_all_bytes,
+            stream_id=video_fmt.get("format_id"),
+        )
+        self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
+                        + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
+        self._emit_line("__POST__{}")
+
+        if is_h264:
+            a_args = ["-c:a", "copy"] if is_aac else ["-c:a", "aac", "-b:a", "192k"]
+            mux_cmd = [str(self.ffmpeg), "-hide_banner", "-y", "-i", str(raw_video)]
+            if raw_audio:
+                mux_cmd += ["-i", str(raw_audio), "-map", "0:v:0", "-map", "1:a:0"]
+            else:
+                mux_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+            mux_cmd += ["-c:v", "copy", *a_args, "-movflags", "+faststart", str(final_path)]
+            if self._run_ffmpeg_with_progress(mux_cmd, forward_progress=False) != 0:
+                return False
+            out_target = final_path
+        else:
+            # Section clip of VP9/AV1 (>1080p): fast-mux into temporary container so start_local_cut
+            # only transcodes the requested clip slice to H.264 instead of the entire video.
+            source_mkv = self.workspace / f"{target_stem}.mkv"
+            mux_cmd = [str(self.ffmpeg), "-hide_banner", "-y", "-i", str(raw_video)]
+            if raw_audio:
+                mux_cmd += ["-i", str(raw_audio), "-map", "0:v:0", "-map", "1:a:0"]
+            else:
+                mux_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+            mux_cmd += ["-c", "copy", str(source_mkv)]
+            if self._run_ffmpeg_with_progress(mux_cmd, forward_progress=False) != 0:
+                return False
+            out_target = source_mkv
+
+        for temp_file in (raw_video, raw_audio):
+            if temp_file:
+                try:
+                    temp_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self._emit_line("__FILE__" + json.dumps(str(out_target)))
+        return True
+
+    def _run_ytdlp_fallback(self) -> int:
+        try:
+            proc = self._spawn_child([str(self.engine), *self.args])
+        except InterruptedError:
+            return 1
+        assert proc.stdout is not None
+        for raw_line in iter(proc.stdout.readline, b""):
+            if self._cancelled:
+                self._kill_child(proc)
+                return 1
+            line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+            if line:
+                self._emit_line(line)
+        code = proc.wait()
+        if code != 0 or self._cancelled:
+            return code
+        if self.job.format == "MP4" and self.job.start_time is None and self._captured_file and self.ffmpeg:
+            out_path = Path(self._captured_file)
+            vcodec, acodec = probe_media_codecs(self.ffprobe, out_path)
+            if vcodec and (vcodec != "h264" or (acodec and acodec != "aac")):
+                transcoded = out_path.with_name(out_path.stem + ".h264.mp4")
+                if self._transcode_local_mp4(out_path, None, transcoded, copy_audio=(acodec == "aac")):
+                    os.replace(transcoded, out_path)
+                    self._emit_line("__FILE__" + json.dumps(str(out_path)))
+                else:
+                    return 1
+        return 0
+
+
 class Window(QMainWindow):
     def __init__(self, data_dir: Path, *, auto_update: bool = True):
         super().__init__()
@@ -684,6 +1478,7 @@ class Window(QMainWindow):
         self.clip_workspace: tempfile.TemporaryDirectory | None = None
         self.clip_destination: Path | None = None
         self.cutting = False
+        self.cut_fallback_args: list[str] | None = None
         self.log_lines: list[str] = []
         self.setWindowTitle("YT İndir · MP3 ve MP4")
         self.setWindowIcon(app_icon())
@@ -1132,6 +1927,10 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             self.check_updates()
             return
         self.current, self.cancelled = job, False
+        self.slow_stream = None
+        self.slow_since = None
+        self.speed_retries = 0
+        self.speed_restart_pending = False
         self.output_buffer, self.log_lines = "", []
         self.conversion_timer.stop()
         self.clip_progress = {}
@@ -1143,6 +1942,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.conversion_started = 0.0
         self.conversion_estimate = 0.0
         self.cutting = False
+        self.cut_fallback_args = None
         self.clip_destination = None
         job.status, job.error, job.output, job.progress = "Bilgiler alınıyor", "", "", 0
         self.set_progress(0, reset=True)
@@ -1161,6 +1961,16 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.sync_buttons()
 
     def start_process(self, program: str, args: list[str]):
+        if not self.cutting and self.current and self.engine and program == str(self.engine):
+            workspace = Path(self.clip_workspace.name) if self.clip_workspace else Path(self.current.folder)
+            self.process = FastDownloadProcess(
+                self.current, Path(program), args, self.ffmpeg, self.ffprobe, self.deno, workspace, self,
+            )
+            self.process.readyReadStandardOutput.connect(self.read_output)
+            self.process.finished.connect(self.download_finished)
+            self.process.errorOccurred.connect(self.process_error)
+            self.process.start()
+            return
         self.process = QProcess(self)
         environment = QProcessEnvironment()
         for key, value in child_environment().items():
@@ -1214,6 +2024,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
                 self.conversion_timer.stop()
                 self.converting = False
                 info = json.loads(line[len("__PROGRESS__"):])
+                self.check_download_speed(info)
                 job.status = "İndiriliyor"
                 total = info.get("total_bytes") or info.get("total_bytes_estimate")
                 downloaded = info.get("downloaded_bytes") or 0
@@ -1243,6 +2054,39 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         except (ValueError, TypeError, KeyError, ZeroDivisionError):
             self.log(line)
         self.refresh_table()
+
+    def check_download_speed(self, info: dict):
+        """Refresh a persistently slow connection twice, then let it finish."""
+        if self.cancelled or self.speed_restart_pending or self.speed_retries >= 2:
+            return
+        stream = info.get("filename") or info.get("tmpfilename")
+        if stream != self.slow_stream:
+            self.slow_stream, self.slow_since = stream, None
+        speed = info.get("speed")
+        if info.get("status") != "downloading" or speed is None or speed >= 256 * 1024:
+            self.slow_since = None
+            return
+        now = time.monotonic()
+        if self.slow_since is None:
+            self.slow_since = now
+        elif now - self.slow_since >= 20:
+            self.speed_retries += 1
+            self.speed_restart_pending = True
+            self.log(f"Bağlantı 20 saniyedir yavaş; yeniden bağlanılıyor ({self.speed_retries}/2).")
+            self.kill_download_process()
+
+    def resume_slow_download(self, job_id: str, process: QProcess):
+        if (not self.current or self.current.id != job_id or not self.speed_restart_pending
+                or self.process is not process or self.cancelled or self.closing):
+            return
+        self.speed_restart_pending = False
+        self.slow_stream, self.slow_since = None, None
+        self.output_buffer = ""
+        self.current.output = ""
+        self.process.deleteLater()
+        self.process = None
+        args = download_arguments(self.current, self.ffmpeg, self.deno, Path(self.clip_workspace.name))
+        self.start_process(str(self.engine), args)
 
     def download_progress_limit(self, job: Job) -> int:
         return 75 if job.start_time is not None else 80
@@ -1294,9 +2138,12 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.refresh_table()
 
     def handle_clip_progress(self, line: str) -> bool:
-        """Read FFmpeg's newline-delimited progress blocks for section downloads."""
+        """Read FFmpeg's newline-delimited progress blocks for section cuts and transcoding."""
         job = self.current
-        if not job or job.start_time is None or job.end_time is None:
+        if not job:
+            return False
+        is_clip = job.start_time is not None and job.end_time is not None
+        if not is_clip and not self.source_duration:
             return False
         key, separator, value = line.partition("=")
         if not separator or key not in {
@@ -1308,21 +2155,25 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         if key != "progress":
             return True
 
+        self.conversion_timer.stop()
+        self.converting = False
         job.status = "Dönüştürülüyor"
-        duration = job.end_time - job.start_time
-        # FFmpeg reports output time relative to the cut, in microseconds.
+        duration = (job.end_time - job.start_time) if is_clip else (self.source_duration or 1.0)
+        # FFmpeg reports output time in microseconds.
         elapsed = self.clip_progress.get("out_time_us", "N/A")
         elapsed = max(0.0, int(elapsed) / 1_000_000) if re.fullmatch(r"-?\d+", elapsed) else None
         size = self.clip_progress.get("total_size", "N/A")
         details = f" · {int(size) / 1048576:.1f} MB kaydedildi" if size.isdigit() else ""
         if elapsed is not None:
-            self.set_progress(85 + min(13, int(elapsed / duration * 13)))
+            start_pct, span = (85, 13) if is_clip else (80, 18)
+            self.set_progress(start_pct + min(span, int(elapsed / duration * span)))
             details += f" · {min(elapsed, duration):.1f} / {duration:.1f} sn"
         speed = self.clip_progress.get("speed", "N/A").removesuffix("x").strip()
         if elapsed is not None and re.fullmatch(r"\d+(?:\.\d+)?", speed) and float(speed) > 0:
             eta = int(max(0, duration - elapsed) / float(speed))
             details += f" · Kalan: {eta // 60}:{eta % 60:02d}"
-        self.status.setText(f"Yerel dosya kesiliyor: {job.title}{details}")
+        prefix = "Yerel dosya kesiliyor" if is_clip else "Birleştiriliyor / dönüştürülüyor"
+        self.status.setText(f"{prefix}: {job.title}{details}")
         self.clip_progress.clear()
         self.refresh_table()
         return True
@@ -1338,6 +2189,25 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             return
         if self.cancelled:
             self.finish_job(False, "Kullanıcı tarafından iptal edildi.")
+        elif self.speed_restart_pending:
+            # Keep the workspace and .part files: yt-dlp re-extracts fresh URLs
+            # and resumes instead of downloading the same bytes again.
+            self.current.status = "Bilgiler alınıyor"
+            self.status.setText("Yavaş bağlantı yenileniyor; indirme kaldığı yerden sürdürülecek…")
+            self.refresh_table()
+            job_id = self.current.id
+            process = self.process
+            QTimer.singleShot(self.speed_retries * 5000, lambda: self.resume_slow_download(job_id, process))
+        elif self.cutting and code != 0 and self.cut_fallback_args:
+            fallback_args = self.cut_fallback_args
+            self.cut_fallback_args = None
+            self.log("Donanım kodlayıcı kesimde başarısız oldu; uyumlu CPU kodlayıcıya geçiliyor…")
+            self.clip_progress = {}
+            self.output_buffer = ""
+            if self.process:
+                self.process.deleteLater()
+                self.process = None
+            self.start_process(str(self.ffmpeg), fallback_args)
         elif code != 0:
             self.finish_job(False, "\n".join(self.log_lines) or f"İşlem hata kodu: {code}")
         elif not self.current.output or not Path(self.current.output).is_file():
@@ -1363,6 +2233,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             return
         output = Path(self.clip_workspace.name) / ("clip." + job.format.lower())
         self.cutting = True
+        self.cut_fallback_args = None
         self.clip_progress = {}
         self.output_buffer = ""
         self.process.deleteLater()
@@ -1371,7 +2242,21 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.status.setText(f"İndirme tamamlandı. Yerel dosya kesiliyor: {job.title}")
         self.set_progress(85)
         self.refresh_table()
-        self.start_process(str(self.ffmpeg), cut_arguments(job, source, output))
+        video_codec_args: list[str] | None = None
+        copy_audio = True
+        if job.format == "MP4":
+            vcodec, acodec = probe_media_codecs(self.ffprobe, source)
+            if vcodec and (vcodec != "h264" or (acodec and acodec != "aac")):
+                copy_audio = (acodec == "aac")
+                encoders = available_h264_encoders(self.ffmpeg)
+                video_codec_args = encoders[0][1]
+                if len(encoders) > 1:
+                    self.cut_fallback_args = cut_arguments(
+                        job, source, output, encoders[-1][1], copy_audio=copy_audio
+                    )
+        self.start_process(str(self.ffmpeg), cut_arguments(
+            job, source, output, video_codec_args, copy_audio=copy_audio
+        ))
 
     def verify_output(self):
         self.conversion_timer.stop()
@@ -1411,7 +2296,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             metadata = json.loads(bytes(self.probe.readAllStandardOutput()))
             streams = metadata.get("streams", [])
             audio = any(s.get("codec_type") == "audio" for s in streams)
-            video = any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic") for s in streams)
+            video_streams = [s for s in streams if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")]
+            video = bool(video_streams) and all(s.get("codec_name", "h264") == "h264" for s in video_streams)
             valid = (code == 0 and audio and float(metadata["format"].get("duration", 0)) > 0
                      and Path(self.current.output).suffix.lower() == "." + self.current.format.lower())
             if self.current.format == "MP4":
@@ -1457,6 +2343,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             self.clip_workspace = None
         self.clip_destination = None
         self.cutting = False
+        self.cut_fallback_args = None
         self.persist()
         self.refresh_table()
         self.set_progress(job.progress)
@@ -1481,19 +2368,26 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.converting = False
         if self.probe:
             self.probe.kill()
+        if self.speed_restart_pending and (not self.process or self.process.state() == QProcess.ProcessState.NotRunning):
+            self.finish_job(False, "Kullanıcı tarafından iptal edildi.")
+        else:
+            self.kill_download_process()
+        self.sync_buttons()
+
+    def kill_download_process(self):
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             pid = self.process.processId()
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-            else:
-                import signal
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            if pid and pid > 0:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    import signal
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             self.process.kill()
-        self.sync_buttons()
 
     def closeEvent(self, event):
         if self.updater is not None:
@@ -1506,10 +2400,16 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         interrupted = self.current
         if interrupted:
             self.cancel_current()
-            if self.process:
-                self.process.waitForFinished(3000)
-            if self.probe:
-                self.probe.waitForFinished(3000)
+        # A Python HTTP worker may still be inside a socket read. Keep Qt and
+        # its thread owners alive until all workers have exited; never destroy
+        # the window after an arbitrary timeout while its QThread is running.
+        if any(proc and proc.state() != QProcess.ProcessState.NotRunning
+               for proc in (self.process, self.probe)):
+            self.status.setText("İndirme durduruluyor; uygulama kapatılıyor…")
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
+        if interrupted:
             interrupted.status, interrupted.progress = "Bekliyor", 0
             interrupted.error, interrupted.output = "", ""
         self.current = None
