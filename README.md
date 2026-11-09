@@ -19,7 +19,9 @@ Paste YouTube links, choose Audio (MP3, the startup default) or Video (MP4), and
 
 Enable **Yalnızca belirli bir bölümü indir** and enter a start and end time, for example `01:00` to `01:30`. Times accept seconds, `MM:SS`, or `HH:MM:SS`, including milliseconds. This works for both MP4 and MP3. The same interval applies to all links added together; each queued item saves its own interval. Disable the option to download the full video again.
 
-The app uses yt-dlp's `--download-sections` with the FFmpeg downloader to seek in the remote media and retrieve the requested section, rather than downloading a full file and trimming it locally. Servers and stream formats may require extra headers, index data or nearby segments; exact network usage depends on the source. MP4 sections are re-encoded for accurate cut boundaries. MP3 sections use the selected audio bitrate. Output names include the interval so clips cannot collide with full downloads or other intervals.
+For sections, the app downloads the complete source using yt-dlp’s normal downloader, then cuts the requested interval locally with FFmpeg. MP4 downloads retain the selected resolution; MP3 downloads fetch the full audio source and encode only the selected interval. Each download uses a private temporary folder under `downloads/` beside `settings.json`, including full downloads. Only verified final files are moved to the selected save folder. The clip is verified before being moved into the save folder, and the full source and temporary files are removed when the job finishes or is cancelled. Leftovers from interrupted or crashed runs are cleaned on the next launch; failed and cancelled jobs are cleaned when they finish. This requires bandwidth and temporary disk space for the full source in the settings location. Download progress shows transferred MB; the local cutting step shows saved MB, processed duration and an ETA when available.
+
+MP4 cuts copy the encoded streams without re-encoding; cut boundaries may differ from the requested times because of keyframes. Output names include the selected interval.
 
 ## Saved settings and updates
 

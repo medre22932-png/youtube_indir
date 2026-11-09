@@ -143,7 +143,10 @@ def save_jobs(path: Path, jobs: list[Job]) -> None:
 def load_jobs(path: Path) -> list[Job]:
     if not path.exists():
         return []
-    jobs = [Job(**j) for j in json.loads(path.read_text(encoding="utf-8"))]
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    for entry in entries:
+        entry.pop("accurate_cut", None)  # Compatibility with previously saved queues.
+    jobs = [Job(**j) for j in entries]
     jobs = [job for job in jobs if job.status == "Bekliyor" or job.status in ACTIVE_STATUSES]
     for job in jobs:
         if job.status in ACTIVE_STATUSES:
@@ -151,7 +154,7 @@ def load_jobs(path: Path) -> list[Job]:
     return jobs
 
 
-def download_arguments(job: Job, ffmpeg: Path, deno: Path) -> list[str]:
+def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path | None = None) -> list[str]:
     args = ["--ignore-config", "--no-playlist", "--newline", "--no-colors", "--progress",
             "--encoding", "utf-8", "--socket-timeout", "20", "--retries", "3",
             "--fragment-retries", "3", "--extractor-retries", "3", "--continue",
@@ -160,7 +163,8 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path) -> list[str]:
             "--progress-template", "download:__PROGRESS__%(progress)j",
             "--progress-template", "postprocess:__POST__%(progress)j",
             "--print", "before_dl:__TITLE__%(title)j", "--print", "after_move:__FILE__%(filepath)j",
-            "--no-simulate", "-P", job.folder]
+            "--print", "before_dl:__STREAMS__%(requested_formats.:.format_id)j",
+            "--no-simulate", "-P", str(source_folder or job.folder)]
     # Quality is part of the name so changing it cannot silently reuse another output.
     section = ""
     if job.start_time is not None or job.end_time is not None:
@@ -168,20 +172,43 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path) -> list[str]:
                 or not 0 <= job.start_time < job.end_time < float("inf")):
             raise ValueError("Geçersiz kesit aralığı.")
         section = f" [{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}s]"
-        args += ["--download-sections", f"*{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}",
-                 "--downloader", "ffmpeg"]
-        if job.format == "MP4":
-            args += ["--force-keyframes-at-cuts"]
     template = f"%(title).140B [%(id)s] [{job.format}-{job.quality}]{section}.%(ext)s"
     args += ["-o", template]
     if job.format == "MP3":
-        args += ["-f", "bestaudio/best", "-x", "--audio-format", "mp3",
-                 "--audio-quality", f"{job.quality}K", "--embed-metadata"]
+        args += ["-f", "bestaudio/best", "--embed-metadata"]
+        if not section:
+            args += ["-x", "--audio-format", "mp3", "--audio-quality", f"{job.quality}K"]
     else:
         limit = "" if job.quality == "best" else f"[height<={int(job.quality)}]"
         args += ["-f", f"bv*{limit}+ba/b{limit}", "--merge-output-format", "mp4",
                  "--remux-video", "mp4"]
     return args + ["--", job.url]
+
+
+def cut_arguments(job: Job, source: Path, output: Path) -> list[str]:
+    if job.start_time is None or job.end_time is None or not 0 <= job.start_time < job.end_time < float("inf"):
+        raise ValueError("Geçersiz kesit aralığı.")
+    args = ["-hide_banner", "-nostdin", "-n", "-ss", timestamp_seconds(job.start_time),
+            "-i", str(source), "-t", timestamp_seconds(job.end_time - job.start_time),
+            "-map_metadata", "0"]
+    if job.format == "MP3":
+        args += ["-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", f"{int(job.quality)}k"]
+    else:
+        args += ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy"]
+    return args + ["-progress", "pipe:1", "-nostats", str(output)]
+
+
+def cleanup_downloads(root: Path) -> list[str]:
+    """Remove only app-owned job folders left by interrupted runs."""
+    errors = []
+    root.mkdir(parents=True, exist_ok=True)
+    for path in root.glob("job-*"):
+        if path.is_dir() and not path.is_symlink():
+            try:
+                shutil.rmtree(path)
+            except OSError as error:
+                errors.append(str(error))
+    return errors
 
 
 import hashlib
@@ -426,10 +453,10 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QProcess, QProcessEnvironment, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QListView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QMenu, QScrollArea, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -464,6 +491,8 @@ class Window(QMainWindow):
         self.data_dir = data_dir
         self.queue_file = data_dir / "queue.json"
         self.settings = StateManager(data_dir)
+        self.downloads_dir = data_dir / "downloads"
+        cleanup_errors = cleanup_downloads(self.downloads_dir)
         self.jobs: list[Job] = []
         self.queue_error = ""
         try:
@@ -486,11 +515,20 @@ class Window(QMainWindow):
         self.last_check = 0.0
         self.allow_old_for_batch = False
         self.output_buffer = ""
+        self.clip_progress: dict[str, str] = {}
+        self.download_streams: dict[str, float] = {}
+        self.stream_count = 1
+        self.update_label = "Güncellemeler denetleniyor…"
+        self.clip_workspace: tempfile.TemporaryDirectory | None = None
+        self.clip_destination: Path | None = None
+        self.cutting = False
         self.log_lines: list[str] = []
         self.setWindowTitle("YT İndir · MP3 ve MP4")
         self.resize(760, 620)
         self.setMinimumSize(640, 540)
         self.build_ui()
+        for error in cleanup_errors:
+            self.log(f"Geçici indirme dosyaları temizlenemedi: {error}")
         self.refresh_table()
         self.quality.setCurrentIndex(max(0, self.quality.findData(self.settings.value("quality", "128" if self.format.currentText() == "MP3" else "best"))))
         if auto_update:
@@ -539,6 +577,14 @@ class Window(QMainWindow):
             formats.addWidget(button)
         layout.addLayout(formats)
         self.quality = QComboBox()
+        self.quality.setObjectName("downloadQuality")
+        self.quality.setView(QListView())
+        self.quality.setStyleSheet("""
+QComboBox#downloadQuality QAbstractItemView {
+    color: black; background-color: white;
+    selection-color: black; selection-background-color: #c9dfff;
+}
+""")
         self.quality.setMinimumHeight(36)
         self.format.currentTextChanged.connect(self.update_qualities)
         self.update_qualities()
@@ -571,7 +617,8 @@ class Window(QMainWindow):
         self.clip_end.setAccessibleName("Kesit bitişi")
         times.addWidget(self.clip_end, 1)
         clip_layout.addLayout(times)
-        clip_help = QLabel("Örnek: 01:00 → 01:30, yalnızca bu 30 saniyeyi indirir.", objectName="subheading")
+        clip_help = QLabel("Örnek: 01:00 → 01:30. Kaynağın tamamı indirilir, sonra bu 30 saniye kesilir.", objectName="subheading")
+        clip_help.setText(clip_help.text() + " Hızlı video kesiminde kesim noktaları tam zamanına uymayabilir.")
         clip_help.setWordWrap(True)
         clip_layout.addWidget(clip_help)
         self.clip_options.hide()
@@ -615,6 +662,9 @@ class Window(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress_animation = QPropertyAnimation(self.progress, b"value", self)
+        self.progress_animation.setDuration(250)
+        self.progress_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.progress.hide()
         layout.addWidget(self.progress)
         self.status = QLabel("Hazır. İlk bağlantınızı yukarıya yapıştırın.", objectName="subheading")
@@ -688,7 +738,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.stop.setEnabled(self.running)
         self.cancel.setEnabled(self.current is not None and not self.cancelled)
         self.update_button.setEnabled(not self.running and not updating)
-        self.start.setText("Hazırlanıyor…" if updating else "İndiriliyor…" if self.running else "İndir")
+        self.start.setText(self.update_label if updating else "İndiriliyor…" if self.running else "İndir")
         self.stop.setVisible(self.running)
         self.cancel.setVisible(self.current is not None)
         self.add_button.setVisible(self.running)
@@ -796,12 +846,38 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         if self.updater is not None or self.current:
             return
         self.updater = UpdateThread(self.data_dir, self)
-        self.updater.message.connect(self.engine_status.setText)
+        self.update_label = "Güncellemeler denetleniyor…"
+        self.updater.message.connect(self.update_message)
         self.updater.ready.connect(self.update_ready)
         self.updater.failed.connect(self.update_failed)
         self.updater.finished.connect(self.update_finished)
         self.updater.start()
         self.sync_buttons()
+
+    def update_message(self, message: str):
+        self.engine_status.setText(message)
+        self.update_label = "Güncelleniyor…" if "güncelleniyor" in message.lower() else "Güncellemeler denetleniyor…"
+        if self.pending_start:
+            self.status.setText(message)
+        self.sync_buttons()
+
+    def set_progress(self, value: int, *, reset: bool = False):
+        """Animate one overall percentage; only a new job may reset it."""
+        value = max(0, min(100, int(value)))
+        if self.current:
+            value = value if reset else max(self.current.progress, value)
+            self.current.progress = value
+        self.progress.setRange(0, 100)
+        if reset:
+            self.progress_animation.stop()
+            self.progress_animation.setStartValue(value)
+            self.progress_animation.setEndValue(value)
+            self.progress.setValue(value)
+        elif self.progress_animation.endValue() != value or self.progress.value() > value:
+            self.progress_animation.stop()
+            self.progress_animation.setStartValue(self.progress.value())
+            self.progress_animation.setEndValue(value)
+            self.progress_animation.start()
 
     def update_ready(self, engine: str, version: str, deno: str):
         self.engine, self.deno = Path(engine), Path(deno)
@@ -889,16 +965,28 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             return
         self.current, self.cancelled = job, False
         self.output_buffer, self.log_lines = "", []
+        self.clip_progress = {}
+        self.download_streams = {}
+        self.stream_count = 1
+        self.cutting = False
+        self.clip_destination = None
         job.status, job.error, job.output, job.progress = "Bilgiler alınıyor", "", "", 0
-        self.progress.setRange(0, 0)
+        self.set_progress(0, reset=True)
         self.status.setText("Video bilgileri alınıyor…")
         try:
             Path(job.folder).mkdir(parents=True, exist_ok=True)
-        except OSError as error:
+            self.clip_workspace = tempfile.TemporaryDirectory(prefix="job-", dir=self.downloads_dir)
+            args = download_arguments(job, self.ffmpeg, self.deno,
+                                      Path(self.clip_workspace.name) if self.clip_workspace else None)
+        except (OSError, ValueError) as error:
             self.finish_job(False, str(error))
             return
         self.persist()
         self.refresh_table()
+        self.start_process(str(self.engine), args)
+        self.sync_buttons()
+
+    def start_process(self, program: str, args: list[str]):
         self.process = QProcess(self)
         environment = QProcessEnvironment()
         for key, value in child_environment().items():
@@ -910,10 +998,9 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.finished.connect(self.download_finished)
         self.process.errorOccurred.connect(self.process_error)
-        self.process.setProgram(str(self.engine))
-        self.process.setArguments(download_arguments(job, self.ffmpeg, self.deno))
+        self.process.setProgram(program)
+        self.process.setArguments(args)
         self.process.start()
-        self.sync_buttons()
 
     def process_error(self, error):
         if error == QProcess.ProcessError.FailedToStart and self.current:
@@ -933,28 +1020,42 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         if not job or not line:
             return
         try:
+            if self.handle_clip_progress(line):
+                return
             if line.startswith("__TITLE__"):
                 job.title = json.loads(line[len("__TITLE__"):])
                 self.log(f"İndiriliyor: {job.title}")
+                if job.start_time is not None:
+                    self.status.setText(f"Tam kaynak indiriliyor: {job.title}")
             elif line.startswith("__FILE__"):
                 job.output = json.loads(line[len("__FILE__"):])
+            elif line.startswith("__STREAMS__"):
+                streams = json.loads(line[len("__STREAMS__"):])
+                self.stream_count = max(1, len(streams)) if isinstance(streams, list) else 1
             elif line.startswith("__PROGRESS__"):
                 info = json.loads(line[len("__PROGRESS__"):])
                 job.status = "İndiriliyor"
                 total = info.get("total_bytes") or info.get("total_bytes_estimate")
-                if total:
-                    job.progress = min(99, int((info.get("downloaded_bytes") or 0) / total * 100))
-                    self.progress.setRange(0, 100)
-                    self.progress.setValue(job.progress)
+                stream = info.get("filename") or info.get("tmpfilename") or "download"
+                fraction = 1.0 if info.get("status") == "finished" else min(1.0, (info.get("downloaded_bytes") or 0) / total) if total else 0.0
+                self.download_streams[stream] = max(self.download_streams.get(stream, 0), fraction)
+                limit = 75 if job.start_time is not None else 90
+                self.set_progress(limit * sum(self.download_streams.values()) / max(self.stream_count, len(self.download_streams)))
                 speed = info.get("speed")
                 eta = info.get("eta")
-                details = f" · {speed / 1048576:.1f} MB/sn" if speed else ""
+                downloaded = info.get("downloaded_bytes") or 0
+                details = f" · {downloaded / 1048576:.1f} MB"
+                if total:
+                    estimated = "≈ " if not info.get("total_bytes") else ""
+                    details += f" / {estimated}{total / 1048576:.1f} MB"
+                if speed:
+                    details += f" · {speed / 1048576:.1f} MB/sn"
                 if eta is not None:
                     details += f" · Kalan: {int(eta) // 60}:{int(eta) % 60:02d}"
                 self.status.setText(f"İndiriliyor: {job.title}{details}")
             elif line.startswith("__POST__") or line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
                 job.status = "Dönüştürülüyor"
-                self.progress.setRange(0, 0)
+                self.set_progress(75 if job.start_time is not None else 90)
                 self.status.setText(f"Birleştiriliyor / dönüştürülüyor: {job.title}")
             else:
                 self.log_lines.append(line)
@@ -963,6 +1064,40 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         except (ValueError, TypeError, KeyError, ZeroDivisionError):
             self.log(line)
         self.refresh_table()
+
+    def handle_clip_progress(self, line: str) -> bool:
+        """Read FFmpeg's newline-delimited progress blocks for section downloads."""
+        job = self.current
+        if not job or job.start_time is None or job.end_time is None:
+            return False
+        key, separator, value = line.partition("=")
+        if not separator or key not in {
+            "frame", "fps", "stream_0_0_q", "bitrate", "total_size", "out_time_us",
+            "out_time_ms", "out_time", "dup_frames", "drop_frames", "speed", "progress",
+        }:
+            return False
+        self.clip_progress[key] = value.strip()
+        if key != "progress":
+            return True
+
+        job.status = "Dönüştürülüyor"
+        duration = job.end_time - job.start_time
+        # FFmpeg reports output time relative to the cut, in microseconds.
+        elapsed = self.clip_progress.get("out_time_us", "N/A")
+        elapsed = max(0.0, int(elapsed) / 1_000_000) if re.fullmatch(r"-?\d+", elapsed) else None
+        size = self.clip_progress.get("total_size", "N/A")
+        details = f" · {int(size) / 1048576:.1f} MB kaydedildi" if size.isdigit() else ""
+        if elapsed is not None:
+            self.set_progress(85 + min(13, int(elapsed / duration * 13)))
+            details += f" · {min(elapsed, duration):.1f} / {duration:.1f} sn"
+        speed = self.clip_progress.get("speed", "N/A").removesuffix("x").strip()
+        if elapsed is not None and re.fullmatch(r"\d+(?:\.\d+)?", speed) and float(speed) > 0:
+            eta = int(max(0, duration - elapsed) / float(speed))
+            details += f" · Kalan: {eta // 60}:{eta % 60:02d}"
+        self.status.setText(f"Yerel dosya kesiliyor: {job.title}{details}")
+        self.clip_progress.clear()
+        self.refresh_table()
+        return True
 
     def download_finished(self, code: int, exit_status):
         self.read_output()
@@ -977,11 +1112,46 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             self.finish_job(False, "\n".join(self.log_lines) or f"İşlem hata kodu: {code}")
         elif not self.current.output or not Path(self.current.output).is_file():
             self.finish_job(False, "Çıktı dosyası bulunamadı.")
+        elif self.current.start_time is not None and not self.cutting:
+            self.start_local_cut()
         else:
             self.verify_output()
 
+    def start_local_cut(self):
+        job = self.current
+        source = Path(job.output)
+        self.clip_destination = Path(job.folder) / source.with_suffix("." + job.format.lower()).name
+        if self.clip_destination.exists():
+            job.output = str(self.clip_destination)
+            self.clip_destination = None
+            self.verify_output()
+            return
+        if not self.clip_workspace:
+            self.finish_job(False, "Kesit için geçici klasör bulunamadı.")
+            return
+        output = Path(self.clip_workspace.name) / ("clip." + job.format.lower())
+        self.cutting = True
+        self.clip_progress = {}
+        self.output_buffer = ""
+        self.process.deleteLater()
+        self.process = None
+        job.output, job.status = str(output), "Dönüştürülüyor"
+        self.status.setText(f"İndirme tamamlandı. Yerel dosya kesiliyor: {job.title}")
+        self.set_progress(85)
+        self.refresh_table()
+        self.start_process(str(self.ffmpeg), cut_arguments(job, source, output))
+
     def verify_output(self):
+        if not self.clip_destination and self.clip_workspace:
+            source = Path(self.current.output)
+            if source.parent == Path(self.clip_workspace.name):
+                destination = Path(self.current.folder) / source.name
+                if destination.exists():
+                    self.current.output = str(destination)
+                else:
+                    self.clip_destination = destination
         self.current.status = "Doğrulanıyor"
+        self.set_progress(99)
         self.refresh_table()
         self.probe = QProcess(self)
         environment = QProcessEnvironment()
@@ -1012,8 +1182,14 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
                      and Path(self.current.output).suffix.lower() == "." + self.current.format.lower())
             if self.current.format == "MP4":
                 valid = valid and video
+            if valid and self.clip_destination:
+                if self.clip_destination.exists():
+                    raise FileExistsError("Hedef dosya zaten var.")
+                # Settings and the destination may be on different drives.
+                shutil.move(self.current.output, self.clip_destination)
+                self.current.output = str(self.clip_destination)
             self.finish_job(bool(valid), "Çıktı dosyası beklenen ses/video biçiminde değil." if not valid else "")
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OSError):
             self.finish_job(False, "Çıktı dosyası doğrulanamadı.")
 
     def finish_job(self, success: bool, error: str = ""):
@@ -1037,12 +1213,19 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         if self.probe:
             self.probe.deleteLater()
             self.probe = None
+        if self.clip_workspace:
+            try:
+                self.clip_workspace.cleanup()
+            except OSError as cleanup_error:
+                self.log(f"Geçici indirme dosyaları temizlenemedi: {cleanup_error}")
+            self.clip_workspace = None
+        self.clip_destination = None
+        self.cutting = False
         self.persist()
         self.refresh_table()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(job.progress)
+        self.set_progress(job.progress)
         self.sync_buttons()
-        QTimer.singleShot(0, self.next_job)
+        QTimer.singleShot(300, self.next_job)
 
     def finish_batch(self, text: str):
         self.running = False
