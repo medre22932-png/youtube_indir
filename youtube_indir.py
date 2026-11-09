@@ -104,6 +104,11 @@ class Job:
     error: str = ""
     start_time: float | None = None
     end_time: float | None = None
+    skip_transcoding: bool = False
+
+    @property
+    def keep_source_video(self) -> bool:
+        return self.skip_transcoding and self.format == "MP4" and self.quality in ("1440", "2160")
 
 
 def parse_timestamp(value: str) -> float:
@@ -163,7 +168,8 @@ def video_output_stem(job: Job, title: str, video_id: str) -> str:
     video_id = re.sub(r"[^\w-]", "_", video_id) or job.id
     section = (f" [{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}s]"
                if job.start_time is not None and job.end_time is not None else "")
-    return f"{title} [{video_id}] [{job.format}-{job.quality}]{section}"
+    mode = "-original" if job.keep_source_video else ""
+    return f"{title} [{video_id}] [{job.format}-{job.quality}{mode}]{section}"
 
 
 def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path | None = None) -> list[str]:
@@ -190,7 +196,8 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path |
                 or not 0 <= job.start_time < job.end_time < float("inf")):
             raise ValueError("Geçersiz kesit aralığı.")
         section = f" [{timestamp_seconds(job.start_time)}-{timestamp_seconds(job.end_time)}s]"
-    template = f"%(title).140B [%(id)s] [{job.format}-{job.quality}]{section}.%(ext)s"
+    mode = "-original" if job.keep_source_video else ""
+    template = f"%(title).140B [%(id)s] [{job.format}-{job.quality}{mode}]{section}.%(ext)s"
     args += ["-o", template]
     if job.format == "MP3":
         args += ["-f", "bestaudio/best", "--embed-metadata"]
@@ -198,13 +205,12 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path |
             args += ["-x", "--audio-format", "mp3", "--audio-quality", f"{job.quality}K"]
     else:
         limit = "" if job.quality == "best" else f"[height<={int(job.quality)}]"
-        args += ["-f", f"bv*{limit}+ba/b{limit}",
-                 "-S", "res,vcodec:h264,acodec:m4a",
+        args += ["-f", f"bv*{limit}+ba/b{limit}", "-S", "res,vcodec:h264,acodec:m4a",
                  "--merge-output-format", "mp4", "--remux-video", "mp4"]
     return args + ["--", job.url]
 
 
-CPU_H264_ARGS = ["-c:v", "libx264", "-preset", "superfast", "-crf", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]
+CPU_H264_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]
 _ENCODER_CACHE: dict[str, list[tuple[str, list[str]]]] = {}
 
 
@@ -214,18 +220,18 @@ def h264_encoder_candidates(system: str | None = None) -> list[tuple[str, list[s
     candidates: list[tuple[str, list[str]]] = []
     if system == "darwin":
         candidates += [
-            ("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
-            ("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-b:v", "20M", "-allow_sw", "1", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-realtime", "1", "-prio_speed", "1", "-q:v", "55", "-allow_sw", "1", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-realtime", "1", "-prio_speed", "1", "-b:v", "12M", "-allow_sw", "1", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
         ]
     elif system == "win32" or system.startswith("linux"):
         candidates += [
-            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
-            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "fast", "-qp", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
-            ("h264_qsv", ["-c:v", "h264_qsv", "-global_quality", "20", "-pix_fmt", "nv12", "-tag:v", "avc1"]),
-            ("h264_amf", ["-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "20", "-qp_p", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "23", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "fast", "-qp", "23", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
+            ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-pix_fmt", "nv12", "-tag:v", "avc1"]),
+            ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]),
         ]
         if system.startswith("linux"):
-            candidates.append(("h264_vaapi", ["-c:v", "h264_vaapi", "-qp", "20", "-tag:v", "avc1"]))
+            candidates.append(("h264_vaapi", ["-c:v", "h264_vaapi", "-qp", "23", "-tag:v", "avc1"]))
     candidates.append(("libx264", list(CPU_H264_ARGS)))
     return candidates
 
@@ -245,8 +251,8 @@ def available_h264_encoders(ffmpeg: Path | None) -> list[tuple[str, list[str]]]:
             continue
         cmd = [
             str(ffmpeg), "-hide_banner", "-nostdin", "-v", "error",
-            "-f", "lavfi", "-i", "color=c=black:s=3840x2160:r=30:d=0.04",
-            "-frames:v", "1", *encoder_args, "-f", "null", "-",
+            "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30:d=0.2",
+            "-frames:v", "5", *encoder_args, "-f", "null", "-",
         ]
         try:
             res = subprocess.run(cmd, capture_output=True, timeout=5, env=child_environment(), **options)
@@ -758,8 +764,8 @@ QProgressBar::chunk { background: #3977e8; border-radius: 5px; }
 
 
 PARALLEL_CONNECTIONS = 8
-RANGE_CHUNK_SIZE = 4 * 1024 * 1024
-MAX_IN_FLIGHT_CHUNKS = 12
+RANGE_CHUNK_SIZE = 1 * 1024 * 1024
+MAX_IN_FLIGHT_CHUNKS = 16
 
 
 def validate_range_response(response, start: int, end: int, total: int | None = None) -> int:
@@ -968,8 +974,9 @@ class FastDownloadProcess(QObject):
 
     def _parallel_download_file(self, url: str, headers: dict, total_size: int, dest_path: Path,
                                 offset_bytes: int, total_all_bytes: int,
-                                pipe_stdin=None, *, stream_id: str | None = None) -> tuple[bool, bool]:
-        """Download via 8 concurrent HTTP range workers, writing ordered chunks to disk and optional FFmpeg pipe."""
+                                pipe_stdin=None, *, stream_id: str | None = None,
+                                on_download_complete=None) -> tuple[bool, bool]:
+        """Download via 8 concurrent HTTP range workers, writing ordered chunks to disk and concurrent FFmpeg pipe."""
         num_chunks = max(1, (total_size + RANGE_CHUNK_SIZE - 1) // RANGE_CHUNK_SIZE)
         # Signed URLs change on reconnect. Format identity and size must match
         # before reusing the contiguous, validated prefix already on disk.
@@ -986,6 +993,9 @@ class FastDownloadProcess(QObject):
         live_lock = threading.Lock()
         live_bytes = [resume_bytes]
         speed_window: deque[tuple[float, int]] = deque()
+        ema_speed: list[float | None] = [None]
+        last_byte_time = [time.monotonic()]
+        last_seen_bytes = [offset_bytes + resume_bytes]
         thread_local = threading.local()
         sessions: list[requests.Session] = []
 
@@ -1046,11 +1056,21 @@ class FastDownloadProcess(QObject):
             now = time.monotonic()
             with live_lock:
                 current_dl = min(total_all_bytes, offset_bytes + live_bytes[0])
+            if current_dl > last_seen_bytes[0]:
+                last_seen_bytes[0] = current_dl
+                last_byte_time[0] = now
             speed_window.append((now, current_dl))
-            while len(speed_window) > 1 and now - speed_window[0][0] > 3.0:
+            while len(speed_window) > 1 and now - speed_window[0][0] > 4.0:
                 speed_window.popleft()
             dt = now - speed_window[0][0] if len(speed_window) > 1 else 0.0
-            speed = (current_dl - speed_window[0][1]) / dt if dt >= 0.15 else None
+            inst_speed = (current_dl - speed_window[0][1]) / dt if dt >= 0.15 else None
+            if inst_speed is not None and inst_speed > 0:
+                ema_speed[0] = inst_speed if ema_speed[0] is None else (0.35 * inst_speed + 0.65 * ema_speed[0])
+            elif ema_speed[0] is not None and (now - last_byte_time[0]) < 15.0:
+                ema_speed[0] *= 0.92
+            else:
+                ema_speed[0] = inst_speed
+            speed = ema_speed[0]
             remaining = max(0, total_all_bytes - current_dl)
             eta = int(remaining / speed) if speed and speed > 0 else None
             payload = {
@@ -1063,21 +1083,50 @@ class FastDownloadProcess(QObject):
             }
             self._emit_line("__PROGRESS__" + json.dumps(payload))
 
-        pipe_ok = pipe_stdin is not None
-        def write_pipe(data: bytes):
-            nonlocal pipe_ok
-            if self._cancelled:
-                raise InterruptedError("Cancelled")
-            if pipe_ok:
-                try:
-                    pipe_stdin.write(data)
-                    pipe_stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pipe_ok = False
-                    try:
-                        pipe_stdin.close()
-                    except OSError:
-                        pass
+        pipe_cond = threading.Condition()
+        disk_frontier = [resume_bytes]
+        download_complete = [False]
+        pipe_ok = [pipe_stdin is not None]
+        feeder_thread: threading.Thread | None = None
+
+        def pipe_feeder():
+            try:
+                with dest_path.open("rb") as reader_file:
+                    fed = 0
+                    while not self._cancelled and pipe_ok[0]:
+                        with pipe_cond:
+                            while (fed >= disk_frontier[0] and not download_complete[0]
+                                   and not self._cancelled and pipe_ok[0]):
+                                pipe_cond.wait(timeout=0.2)
+                            available = disk_frontier[0] - fed
+                            done = download_complete[0]
+                        if self._cancelled or not pipe_ok[0]:
+                            break
+                        if available <= 0:
+                            if done:
+                                break
+                            continue
+                        data = reader_file.read(min(256 * 1024, available))
+                        if not data:
+                            reader_file.seek(fed)
+                            data = reader_file.read(min(256 * 1024, available))
+                            if not data:
+                                if done:
+                                    break
+                                continue
+                        try:
+                            pipe_stdin.write(data)
+                            pipe_stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            pipe_ok[0] = False
+                            try:
+                                pipe_stdin.close()
+                            except OSError:
+                                pass
+                            break
+                        fed += len(data)
+            except OSError:
+                pipe_ok[0] = False
 
         in_flight: dict[int, concurrent.futures.Future[bytes]] = {}
         first_chunk = (resume_bytes + RANGE_CHUNK_SIZE - 1) // RANGE_CHUNK_SIZE
@@ -1092,17 +1141,12 @@ class FastDownloadProcess(QObject):
             stack.callback(close_sessions)
             out_file = stack.enter_context(dest_path.open("r+b" if dest_path.exists() else "w+b"))
             out_file.truncate(resume_bytes)
+            out_file.flush()
             resume_path.write_text(json.dumps(identity), encoding="utf-8")
-            # FFmpeg's new pipe needs the existing prefix too, even though the
-            # network only needs to fetch the remaining ranges.
-            remaining_prefix = resume_bytes
-            while pipe_ok and remaining_prefix:
-                data = out_file.read(min(64 * 1024, remaining_prefix))
-                if not data:
-                    raise ValueError("Devam dosyası beklenenden kısa.")
-                write_pipe(data)
-                remaining_prefix -= len(data)
             out_file.seek(resume_bytes)
+            if pipe_stdin is not None:
+                feeder_thread = threading.Thread(target=pipe_feeder, daemon=True)
+                feeder_thread.start()
             pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_CONNECTIONS))
             try:
                 for next_write in range(first_chunk, num_chunks):
@@ -1132,17 +1176,27 @@ class FastDownloadProcess(QObject):
 
                     out_file.write(chunk_data)
                     out_file.flush()
-                    write_pipe(chunk_data)
+                    with pipe_cond:
+                        disk_frontier[0] += len(chunk_data)
+                        pipe_cond.notify_all()
 
                     now = time.monotonic()
                     if now - last_report >= 0.2:
                         emit_progress(False)
                         last_report = now
             finally:
+                with pipe_cond:
+                    download_complete[0] = True
+                    pipe_cond.notify_all()
                 for fut in in_flight.values():
                     fut.cancel()
 
-        return True, pipe_ok
+            if on_download_complete is not None:
+                on_download_complete()
+            if feeder_thread is not None:
+                feeder_thread.join()
+
+        return True, pipe_ok[0]
 
     def _run_ffmpeg_with_progress(self, cmd: list[str], *, forward_progress: bool = True) -> int:
         proc = self._spawn_child(cmd)
@@ -1228,15 +1282,18 @@ class FastDownloadProcess(QObject):
                     "-progress", "pipe:1", "-nostats", str(final_path),
                 ]
                 ff_proc = self._spawn_child(mp3_cmd, stdin=subprocess.PIPE)
-                download_done = threading.Event()
 
                 def drain_mp3():
                     assert ff_proc.stdout is not None
                     for raw in iter(ff_proc.stdout.readline, b""):
-                        if download_done.is_set():
-                            line = raw.decode("utf-8", "replace").strip()
-                            if line:
-                                self._emit_line(line)
+                        line = raw.decode("utf-8", "replace").strip()
+                        if line:
+                            self._emit_line(line)
+
+                def finish_mp3_download():
+                    self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
+                                    + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
+                    self._emit_line("__POST__{}")
 
                 reader = threading.Thread(target=drain_mp3, daemon=True)
                 reader.start()
@@ -1244,16 +1301,13 @@ class FastDownloadProcess(QObject):
                     fmt["url"], fmt.get("http_headers") or {}, stream_sizes[0],
                     raw_audio, 0, total_all_bytes, pipe_stdin=ff_proc.stdin,
                     stream_id=fmt.get("format_id"),
+                    on_download_complete=finish_mp3_download,
                 )
-                download_done.set()
-                self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
-                                + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
                 if ff_proc.stdin:
                     try:
                         ff_proc.stdin.close()
                     except OSError:
                         pass
-                self._emit_line("__POST__{}")
                 code = ff_proc.wait()
                 reader.join(timeout=2.0)
                 if not pipe_ok or code != 0 or not final_path.is_file() or final_path.stat().st_size == 0:
@@ -1291,6 +1345,8 @@ class FastDownloadProcess(QObject):
         acodec = ((audio_fmt or video_fmt).get("acodec") or "").lower()
         is_h264 = vcodec.startswith(("avc1", "h264"))
         is_aac = acodec.startswith(("mp4a", "aac"))
+        if not is_h264 and not self.job.keep_source_video and self.job.start_time is None:
+            self._emit_line("__TRANSCODE_MODE__1")
 
         raw_audio: Path | None = None
         offset = 0
@@ -1307,7 +1363,7 @@ class FastDownloadProcess(QObject):
         v_ext = "." + (video_fmt.get("ext") or "webm").lstrip(".")
         raw_video = self.workspace / f"raw_video{v_ext}"
 
-        if not is_h264 and self.job.start_time is None:
+        if not is_h264 and not self.job.keep_source_video and self.job.start_time is None:
             # >1080p VP9/AV1 full video: transcode on the fly while parallel-downloading video chunks!
             encoders = available_h264_encoders(self.ffmpeg)
             enc_name, enc_args = encoders[0]
@@ -1317,15 +1373,18 @@ class FastDownloadProcess(QObject):
                 final_path, enc_args, copy_audio=is_aac,
             )]
             ff_proc = self._spawn_child(fly_cmd, stdin=subprocess.PIPE)
-            download_done = threading.Event()
 
             def drain_video():
                 assert ff_proc.stdout is not None
                 for raw in iter(ff_proc.stdout.readline, b""):
-                    if download_done.is_set():
-                        line = raw.decode("utf-8", "replace").strip()
-                        if line:
-                            self._emit_line(line)
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        self._emit_line(line)
+
+            def finish_video_download():
+                self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
+                                + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
+                self._emit_line("__POST__{}")
 
             reader = threading.Thread(target=drain_video, daemon=True)
             reader.start()
@@ -1333,16 +1392,13 @@ class FastDownloadProcess(QObject):
                 video_fmt["url"], video_fmt.get("http_headers") or {}, video_size,
                 raw_video, offset, total_all_bytes, pipe_stdin=ff_proc.stdin,
                 stream_id=video_fmt.get("format_id"),
+                on_download_complete=finish_video_download,
             )
-            download_done.set()
-            self._emit_line('__PROGRESS__{"filename":"download","status":"finished","downloaded_bytes":'
-                            + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
             if ff_proc.stdin:
                 try:
                     ff_proc.stdin.close()
                 except OSError:
                     pass
-            self._emit_line("__POST__{}")
             code = ff_proc.wait()
             reader.join(timeout=2.0)
 
@@ -1369,7 +1425,7 @@ class FastDownloadProcess(QObject):
                         + f'{total_all_bytes},"total_bytes":{total_all_bytes}}}')
         self._emit_line("__POST__{}")
 
-        if is_h264:
+        if is_h264 or self.job.keep_source_video:
             a_args = ["-c:a", "copy"] if is_aac else ["-c:a", "aac", "-b:a", "192k"]
             mux_cmd = [str(self.ffmpeg), "-hide_banner", "-y", "-i", str(raw_video)]
             if raw_audio:
@@ -1419,7 +1475,8 @@ class FastDownloadProcess(QObject):
         code = proc.wait()
         if code != 0 or self._cancelled:
             return code
-        if self.job.format == "MP4" and self.job.start_time is None and self._captured_file and self.ffmpeg:
+        if (self.job.format == "MP4" and not self.job.keep_source_video
+                and self.job.start_time is None and self._captured_file and self.ffmpeg):
             out_path = Path(self._captured_file)
             vcodec, acodec = probe_media_codecs(self.ffprobe, out_path)
             if vcodec and (vcodec != "h264" or (acodec and acodec != "aac")):
@@ -1458,6 +1515,10 @@ class Window(QMainWindow):
         self.closing = False
         self.stop_after = False
         self.cancelled = False
+        self.slow_stream: str | None = None
+        self.slow_since: float | None = None
+        self.speed_retries = 0
+        self.speed_restart_pending = False
         self.pending_start = False
         self.last_check = 0.0
         self.allow_old_for_batch = False
@@ -1467,6 +1528,13 @@ class Window(QMainWindow):
         self.download_bytes: dict[str, int] = {}
         self.source_duration: float | None = None
         self.stream_count = 1
+        self.transcode_mode = False
+        self.download_finished_flag = False
+        self.transcode_fraction: float | None = None
+        self.transcode_speed = ""
+        self.transcode_eta: float | None = None
+        self.download_eta: float | None = None
+        self.download_details = ""
         self.converting = False
         self.conversion_started = 0.0
         self.conversion_estimate = 0.0
@@ -1487,7 +1555,9 @@ class Window(QMainWindow):
         for error in cleanup_errors:
             self.log(f"Geçici indirme dosyaları temizlenemedi: {error}")
         self.refresh_table()
-        self.quality.setCurrentIndex(max(0, self.quality.findData(self.settings.value("quality", "128" if self.format.currentText() == "MP3" else "best"))))
+        saved_quality_index = self.quality.findData(self.settings.value("quality"))
+        if saved_quality_index >= 0:
+            self.quality.setCurrentIndex(saved_quality_index)
         if auto_update:
             QTimer.singleShot(0, self.check_updates)
 
@@ -1563,7 +1633,7 @@ QComboBox#downloadQuality QAbstractItemView {
         folder_row.addWidget(browse)
         layout.addLayout(folder_row)
 
-        self.clip_enabled = QCheckBox("Yalnızca belirli bir bölümü indir")
+        self.clip_enabled = QCheckBox("Yalnızca belli bir bölümü kaydet")
         layout.addWidget(self.clip_enabled)
         self.clip_options = QWidget()
         clip_layout = QVBoxLayout(self.clip_options)
@@ -1580,7 +1650,6 @@ QComboBox#downloadQuality QAbstractItemView {
         times.addWidget(self.clip_end, 1)
         clip_layout.addLayout(times)
         clip_help = QLabel("Örnek: 01:00 → 01:30. Kaynağın tamamı indirilir, sonra bu 30 saniye kesilir.", objectName="subheading")
-        clip_help.setText(clip_help.text() + " Hızlı video kesiminde kesim noktaları tam zamanına uymayabilir.")
         clip_help.setWordWrap(True)
         clip_layout.addWidget(clip_help)
         self.clip_options.hide()
@@ -1605,6 +1674,31 @@ QComboBox#downloadQuality QAbstractItemView {
         options_button.toggled.connect(lambda checked: options_button.setText(
             "Kalite ve ayarlar ▾" if checked else "Kalite ve ayarlar ▸"))
         layout.addWidget(self.options)
+
+        advanced_button = QPushButton("Gelişmiş ayarlar ▸")
+        advanced_button.setCheckable(True)
+        options_layout.addWidget(advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advanced_options = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_options)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.skip_transcoding = QCheckBox("1440p ve 2160p için decoding’i atla")
+        self.skip_transcoding.setChecked(self.settings.value("skip_transcoding", False) is True)
+        self.skip_transcoding.toggled.connect(
+            lambda checked: self.settings.setValue("skip_transcoding", checked))
+        advanced_layout.addWidget(self.skip_transcoding)
+        advanced_help = QLabel(
+            "Çok daha hızlı işlenir; video özgün codec’iyle kaydedilir. "
+            "Fakat AV1 videolarını Adobe gibi programlarda kullanmak için AV1 eklentisi gerekir. "
+            "Gerekli destek, indirilen codec’e ve programın sürümüne göre değişebilir.",
+            objectName="subheading")
+        advanced_help.setWordWrap(True)
+        advanced_layout.addWidget(advanced_help)
+        self.advanced_options.hide()
+        advanced_button.toggled.connect(self.advanced_options.setVisible)
+        advanced_button.toggled.connect(lambda checked: advanced_button.setText(
+            "Gelişmiş ayarlar ▾" if checked else "Gelişmiş ayarlar ▸"))
+        options_button.toggled.connect(lambda checked: advanced_button.setChecked(False) if not checked else None)
+        options_layout.addWidget(self.advanced_options)
 
         actions = QHBoxLayout()
         self.start = QPushButton("İndir", objectName="primary")
@@ -1690,9 +1784,10 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             for value in (128, 192, 256, 320):
                 self.quality.addItem(f"{value} kbps", str(value))
         else:
-            self.quality.addItem("En iyi çözünürlük", "best")
             for value in (2160, 1440, 1080, 720, 480):
-                self.quality.addItem(f"En fazla {value}p", str(value))
+                suffix = " (slow decoding)" if value > 1080 else ""
+                self.quality.addItem(f"En fazla {value}p{suffix}", str(value))
+            self.quality.setCurrentIndex(self.quality.findData("1080"))
 
     def sync_buttons(self):
         updating = self.updater is not None
@@ -1764,7 +1859,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             return False
         for url in links:
             self.jobs.append(Job(url, self.format.currentText(), self.quality.currentData(), folder,
-                                 start_time=start_time, end_time=end_time))
+                                 start_time=start_time, end_time=end_time,
+                                 skip_transcoding=self.skip_transcoding.isChecked()))
         self.links.clear()
         self.settings.setValue("folder", folder)
         self.settings.setValue("format", self.format.currentText())
@@ -1937,6 +2033,13 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.download_bytes = {}
         self.source_duration = None
         self.stream_count = 1
+        self.transcode_mode = False
+        self.download_finished_flag = False
+        self.transcode_fraction = None
+        self.transcode_speed = ""
+        self.transcode_eta = None
+        self.download_eta = None
+        self.download_details = ""
         self.converting = False
         self.conversion_started = 0.0
         self.conversion_estimate = 0.0
@@ -2019,20 +2122,27 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
                 duration = json.loads(line[len("__DURATION__"):])
                 if isinstance(duration, (int, float)) and duration > 0:
                     self.source_duration = float(duration)
+            elif line.startswith("__TRANSCODE_MODE__"):
+                self.transcode_mode = True
             elif line.startswith("__PROGRESS__"):
                 self.conversion_timer.stop()
                 self.converting = False
                 info = json.loads(line[len("__PROGRESS__"):])
                 self.check_download_speed(info)
+                is_finished = info.get("status") == "finished"
+                if is_finished:
+                    self.download_finished_flag = True
                 job.status = "İndiriliyor"
                 total = info.get("total_bytes") or info.get("total_bytes_estimate")
                 downloaded = info.get("downloaded_bytes") or 0
                 stream = info.get("filename") or info.get("tmpfilename") or "download"
-                fraction = 1.0 if info.get("status") == "finished" else min(1.0, downloaded / total) if total else 0.0
+                fraction = 1.0 if is_finished else min(1.0, downloaded / total) if total else 0.0
                 self.download_streams[stream] = max(self.download_streams.get(stream, 0), fraction)
                 self.download_bytes[stream] = max(self.download_bytes.get(stream, 0), int(total or downloaded or 0))
+                dl_frac = sum(self.download_streams.values()) / max(self.stream_count, len(self.download_streams))
                 limit = self.download_progress_limit(job)
-                self.set_progress(limit * sum(self.download_streams.values()) / max(self.stream_count, len(self.download_streams)))
+                if not self.transcode_mode and self.transcode_fraction is None:
+                    self.set_progress(int(limit * dl_frac))
                 speed = info.get("speed")
                 eta = info.get("eta")
                 details = f" · {downloaded / 1048576:.1f} MB"
@@ -2041,6 +2151,12 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
                     details += f" / {estimated}{total / 1048576:.1f} MB"
                 if speed:
                     details += f" · {speed / 1048576:.1f} MB/sn"
+                self.download_details = details
+                self.download_eta = eta
+                if self.transcode_mode or self.transcode_fraction is not None:
+                    self.update_pipeline_progress()
+                    self.refresh_table()
+                    return
                 if eta is not None:
                     details += f" · Kalan: {int(eta) // 60}:{int(eta) % 60:02d}"
                 self.status.setText(f"İndiriliyor: {job.title}{details}")
@@ -2053,6 +2169,28 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         except (ValueError, TypeError, KeyError, ZeroDivisionError):
             self.log(line)
         self.refresh_table()
+
+    def update_pipeline_progress(self):
+        """Show the slower stage of the overlapping download/transcode pipeline."""
+        job = self.current
+        if not job:
+            return
+        downloaded = (1.0 if self.download_finished_flag else
+                      sum(self.download_streams.values()) / max(self.stream_count, len(self.download_streams)))
+        converted = self.transcode_fraction or 0.0
+        self.set_progress(int(98 * min(downloaded, converted)))
+        conversion_is_behind = converted <= downloaded
+        job.status = "Dönüştürülüyor" if conversion_is_behind else "İndiriliyor"
+        eta = self.transcode_eta if conversion_is_behind else self.download_eta
+        details = self.download_details
+        if eta is not None:
+            seconds = max(0, int(eta))
+            details += f" · Kalan: {seconds // 60}:{seconds % 60:02d}"
+        else:
+            details += " · Kalan: hesaplanıyor…"
+        speed = f" ({self.transcode_speed})" if self.transcode_speed else ""
+        details += f" · Dönüştürme: %{int(converted * 100)}{speed}"
+        self.status.setText(f"{job.status}: {job.title}{details}")
 
     def check_download_speed(self, info: dict):
         """Refresh a persistently slow connection twice, then let it finish."""
@@ -2088,10 +2226,14 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.start_process(str(self.engine), args)
 
     def download_progress_limit(self, job: Job) -> int:
-        return 75 if job.start_time is not None else 80
+        if job.start_time is not None:
+            return 75
+        return 40 if self.transcode_mode else 80
 
     def conversion_progress_range(self, job: Job) -> tuple[int, int]:
-        return (75, 84) if job.start_time is not None else (80, 98)
+        if job.start_time is not None:
+            return (75, 84)
+        return (40, 98) if self.transcode_mode else (80, 98)
 
     def estimate_conversion_seconds(self) -> float:
         job = self.current
@@ -2111,7 +2253,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
 
     def start_conversion_progress(self):
         job = self.current
-        if not job:
+        if not job or self.transcode_fraction is not None:
             return
         if not self.converting:
             self.converting = True
@@ -2156,20 +2298,35 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
 
         self.conversion_timer.stop()
         self.converting = False
-        job.status = "Dönüştürülüyor"
         duration = (job.end_time - job.start_time) if is_clip else (self.source_duration or 1.0)
         # FFmpeg reports output time in microseconds.
         elapsed = self.clip_progress.get("out_time_us", "N/A")
         elapsed = max(0.0, int(elapsed) / 1_000_000) if re.fullmatch(r"-?\d+", elapsed) else None
+        speed = self.clip_progress.get("speed", "N/A").removesuffix("x").strip()
+        speed_val = float(speed) if re.fullmatch(r"\d+(?:\.\d+)?", speed) and float(speed) > 0 else None
+        if not is_clip:
+            if elapsed is not None and duration > 0:
+                self.transcode_fraction = min(1.0, elapsed / duration)
+            if speed_val is not None:
+                self.transcode_speed = f"{speed_val:.1f}x"
+            self.transcode_eta = (max(0.0, duration - elapsed) / speed_val
+                                  if elapsed is not None and speed_val is not None else None)
+            if self.transcode_mode:
+                self.update_pipeline_progress()
+                self.clip_progress.clear()
+                self.refresh_table()
+                return True
+        job.status = "Dönüştürülüyor"
         size = self.clip_progress.get("total_size", "N/A")
         details = f" · {int(size) / 1048576:.1f} MB kaydedildi" if size.isdigit() else ""
         if elapsed is not None:
-            start_pct, span = (85, 13) if is_clip else (80, 18)
+            start_pct, span = (85, 13) if is_clip else ((40, 58) if self.transcode_mode else (80, 18))
             self.set_progress(start_pct + min(span, int(elapsed / duration * span)))
             details += f" · {min(elapsed, duration):.1f} / {duration:.1f} sn"
-        speed = self.clip_progress.get("speed", "N/A").removesuffix("x").strip()
-        if elapsed is not None and re.fullmatch(r"\d+(?:\.\d+)?", speed) and float(speed) > 0:
-            eta = int(max(0, duration - elapsed) / float(speed))
+        if elapsed is not None and speed_val is not None:
+            if not is_clip:
+                details += f" · {speed_val:.1f}x"
+            eta = int(max(0, duration - elapsed) / speed_val)
             details += f" · Kalan: {eta // 60}:{eta % 60:02d}"
         prefix = "Yerel dosya kesiliyor" if is_clip else "Birleştiriliyor / dönüştürülüyor"
         self.status.setText(f"{prefix}: {job.title}{details}")
@@ -2243,7 +2400,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.refresh_table()
         video_codec_args: list[str] | None = None
         copy_audio = True
-        if job.format == "MP4":
+        if job.format == "MP4" and not job.keep_source_video:
             vcodec, acodec = probe_media_codecs(self.ffprobe, source)
             if vcodec and (vcodec != "h264" or (acodec and acodec != "aac")):
                 copy_audio = (acodec == "aac")
@@ -2296,7 +2453,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             streams = metadata.get("streams", [])
             audio = any(s.get("codec_type") == "audio" for s in streams)
             video_streams = [s for s in streams if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")]
-            video = bool(video_streams) and all(s.get("codec_name", "h264") == "h264" for s in video_streams)
+            allowed_codecs = {"h264", "av1", "vp9"} if self.current.keep_source_video else {"h264"}
+            video = bool(video_streams) and all(s.get("codec_name", "h264") in allowed_codecs for s in video_streams)
             valid = (code == 0 and audio and float(metadata["format"].get("duration", 0)) > 0
                      and Path(self.current.output).suffix.lower() == "." + self.current.format.lower())
             if self.current.format == "MP4":

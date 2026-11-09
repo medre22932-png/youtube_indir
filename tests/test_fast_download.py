@@ -1,5 +1,6 @@
 """Offline regression checks for range integrity, reconnects and Qt shutdown."""
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -217,6 +218,124 @@ class DownloadTests(unittest.TestCase):
                         self.assertIn("[10-20s]", final_name)
                     self.assertNotIn("output.", final_name)
                     self.assertNotIn("raw_audio", final_name)
+
+    def test_skip_transcoding_muxes_high_resolution_source_video(self):
+        self.job.skip_transcoding = True
+        self.proc.ffmpeg = Path(app.__file__)
+        for quality in ("1440", "2160"):
+            for codec in ("av01", "vp9"):
+                for section in (False, True):
+                    with self.subTest(quality=quality, codec=codec, section=section):
+                        self.job.quality = quality
+                        self.job.start_time = 10 if section else None
+                        self.job.end_time = 20 if section else None
+                        info = {"title": "Original", "id": "video123", "ext": "webm",
+                                "url": "https://cdn.example/video", "format_id": "401",
+                                "vcodec": codec, "acodec": "opus"}
+                        def mux(cmd, **kwargs):
+                            self.assertIn("-c:v", cmd)
+                            self.assertEqual(cmd[cmd.index("-c:v") + 1], "copy")
+                            Path(cmd[-1]).write_bytes(b"original video")
+                            return 0
+                        with patch.object(self.proc, "_extract_info", return_value=info), \
+                             patch.object(self.proc, "_run_ffmpeg_with_progress", side_effect=mux) as runner, \
+                             patch.object(self.proc, "_probe_stream_range", return_value=31), \
+                             patch.object(self.proc, "_transcode_local_mp4") as transcode:
+                            self.assertTrue(self.proc._try_parallel_pipeline())
+                            runner.assert_called_once()
+                            transcode.assert_not_called()
+                        self.assertIn("-original]", self.proc._captured_file)
+                        self.assertEqual(Path(self.proc._captured_file).suffix, ".mp4")
+
+    def test_skip_transcoding_scope_and_queue_persistence(self):
+        self.job.skip_transcoding = True
+        for format_name, quality, expected in (("MP4", "1440", True), ("MP4", "2160", True),
+                                               ("MP4", "1080", False), ("MP3", "192", False)):
+            self.job.format, self.job.quality = format_name, quality
+            self.assertEqual(self.job.keep_source_video, expected)
+        queue = self.root / "queue.json"
+        app.save_jobs(queue, [self.job])
+        self.assertTrue(app.load_jobs(queue)[0].skip_transcoding)
+        entries = json.loads(queue.read_text())
+        entries[0].pop("skip_transcoding")
+        queue.write_text(json.dumps(entries))
+        self.assertFalse(app.load_jobs(queue)[0].skip_transcoding)
+
+
+class PipelineProgressTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.qt = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.window = app.Window(Path(self.directory.name), auto_update=False)
+        self.window.current = app.Job("https://youtu.be/example", "MP4", "1440", self.directory.name)
+        self.window.handle_line('__DURATION__100')
+        self.window.handle_line('__TRANSCODE_MODE__')
+
+    def tearDown(self):
+        self.window.current = None
+        self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.directory.cleanup()
+
+    def download(self, fraction, eta, status="downloading"):
+        self.window.handle_line('__PROGRESS__' + json.dumps({
+            "filename": "video", "total_bytes": 1000, "downloaded_bytes": fraction * 1000,
+            "eta": eta, "status": status,
+        }))
+
+    def test_advanced_setting_defaults_off_and_persists(self):
+        self.assertFalse(self.window.skip_transcoding.isChecked())
+        self.assertEqual(self.window.clip_enabled.text(), "Yalnızca belli bir bölümü kaydet")
+        self.window.skip_transcoding.setChecked(True)
+        restored = app.Window(Path(self.directory.name), auto_update=False)
+        try:
+            self.assertTrue(restored.skip_transcoding.isChecked())
+            restored.skip_transcoding.setChecked(False)
+            self.assertFalse(app.StateManager(Path(self.directory.name)).value("skip_transcoding"))
+        finally:
+            restored.close()
+            restored.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def convert(self, seconds, speed="2x"):
+        for line in (f"out_time_us={seconds * 1000000}", f"speed={speed}", "progress=continue"):
+            self.window.handle_line(line)
+
+    def test_conversion_controls_progress_and_eta_on_both_updates(self):
+        self.download(.8, 5)
+        self.assertEqual(self.window.current.progress, 0)
+        self.assertIn("hesaplanıyor", self.window.status.text())
+        self.convert(20)
+        self.assertEqual(self.window.current.progress, 19)
+        self.assertIn("Kalan: 0:40", self.window.status.text())
+        self.download(.9, 2)
+        self.assertEqual(self.window.current.progress, 19)
+        self.assertIn("Kalan: 0:40", self.window.status.text())
+        self.convert(40)
+        self.assertEqual(self.window.current.progress, 39)
+        self.assertIn("Kalan: 0:30", self.window.status.text())
+
+    def test_download_completion_does_not_jump_ahead_of_conversion(self):
+        self.download(.8, 5)
+        self.convert(20)
+        self.download(1, 0, "finished")
+        self.assertEqual(self.window.current.progress, 19)
+        self.convert(40)
+        self.assertEqual(self.window.current.progress, 39)
+        self.assertIn("Kalan: 0:30", self.window.status.text())
+        self.convert(100)
+        self.assertEqual(self.window.current.progress, 98)
+
+    def test_download_controls_progress_when_it_is_behind(self):
+        self.download(.2, 120)
+        self.convert(80)
+        self.assertEqual(self.window.current.progress, 19)
+        self.assertIn("Kalan: 2:00", self.window.status.text())
+        self.assertEqual(self.window.current.status, "İndiriliyor")
 
 
 class ShutdownTests(unittest.TestCase):
