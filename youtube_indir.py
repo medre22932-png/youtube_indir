@@ -164,6 +164,7 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path |
             "--progress-template", "postprocess:__POST__%(progress)j",
             "--print", "before_dl:__TITLE__%(title)j", "--print", "after_move:__FILE__%(filepath)j",
             "--print", "before_dl:__STREAMS__%(requested_formats.:.format_id)j",
+            "--print", "before_dl:__DURATION__%(duration)j",
             "--no-simulate", "-P", str(source_folder or job.folder)]
     # Quality is part of the name so changing it cannot silently reuse another output.
     section = ""
@@ -180,8 +181,10 @@ def download_arguments(job: Job, ffmpeg: Path, deno: Path, source_folder: Path |
             args += ["-x", "--audio-format", "mp3", "--audio-quality", f"{job.quality}K"]
     else:
         limit = "" if job.quality == "best" else f"[height<={int(job.quality)}]"
-        args += ["-f", f"bv*{limit}+ba/b{limit}", "--merge-output-format", "mp4",
-                 "--remux-video", "mp4"]
+        high_res = f"bv*[height>1080]{limit}[vcodec!^=av01]+ba/" if job.quality == "best" or int(job.quality) > 1080 else ""
+        args += ["-f", f"{high_res}bv*{limit}+ba/b{limit}",
+                 "-S", "res,vcodec:h264,acodec:m4a",
+                 "--merge-output-format", "mp4", "--remux-video", "mp4"]
     return args + ["--", job.url]
 
 
@@ -448,18 +451,169 @@ class StateManager:
 
 import json
 import os
+import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QProcess, QProcessEnvironment, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import (
+    QBuffer, QByteArray, QEasingCurve, QIODevice, QPointF, QPropertyAnimation,
+    QProcess, QProcessEnvironment, QRectF, Qt, QTimer, QUrl,
+)
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QIcon, QImage, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient, QTransform,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QListView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QMenu, QScrollArea, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+
+def render_icon_image(size: int = 256) -> QImage:
+    image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    scale = size / 256.0
+    painter.scale(scale, scale)
+
+    bg_rect = QRectF(14, 14, 228, 228)
+    bg_gradient = QLinearGradient(14, 14, 242, 242)
+    bg_gradient.setColorAt(0.0, QColor("#1f2e47"))
+    bg_gradient.setColorAt(0.55, QColor("#141d2e"))
+    bg_gradient.setColorAt(1.0, QColor("#0d131f"))
+    painter.setPen(QPen(QColor("#385179"), 4.5))
+    painter.setBrush(bg_gradient)
+    painter.drawRoundedRect(bg_rect, 54, 54)
+
+    glow = QRadialGradient(QPointF(128, 118), 96)
+    glow.setColorAt(0.0, QColor(57, 119, 232, 65))
+    glow.setColorAt(1.0, QColor(57, 119, 232, 0))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(glow)
+    painter.drawEllipse(QPointF(128, 118), 96, 96)
+
+    card_rect = QRectF(38, 44, 170, 114)
+    card_grad = QLinearGradient(38, 44, 208, 158)
+    card_grad.setColorAt(0.0, QColor("#ff475e"))
+    card_grad.setColorAt(0.5, QColor("#f21b38"))
+    card_grad.setColorAt(1.0, QColor("#c40d26"))
+    painter.setPen(QPen(QColor(255, 255, 255, 50), 2.5))
+    painter.setBrush(card_grad)
+    painter.drawRoundedRect(card_rect, 30, 30)
+
+    play = QPainterPath()
+    play.moveTo(106, 75)
+    play.lineTo(152, 101)
+    play.lineTo(106, 127)
+    play.closeSubpath()
+    painter.setPen(QPen(QColor("#ffffff"), 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawPath(play)
+
+    badge_center = QPointF(170, 170)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#111722"))
+    painter.drawEllipse(badge_center, 50, 50)
+
+    badge_grad = QLinearGradient(126, 126, 214, 214)
+    badge_grad.setColorAt(0.0, QColor("#5ea0ff"))
+    badge_grad.setColorAt(0.5, QColor("#3977e8"))
+    badge_grad.setColorAt(1.0, QColor("#1f53b8"))
+    painter.setPen(QPen(QColor("#8ab8ff"), 2.5))
+    painter.setBrush(badge_grad)
+    painter.drawEllipse(badge_center, 44, 44)
+
+    arrow_pen = QPen(QColor("#ffffff"), 9.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(arrow_pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawLine(QPointF(170, 144), QPointF(170, 177))
+    chevron = QPainterPath()
+    chevron.moveTo(154, 165)
+    chevron.lineTo(170, 181)
+    chevron.lineTo(186, 165)
+    painter.drawPath(chevron)
+    painter.drawLine(QPointF(153, 193), QPointF(187, 193))
+
+    painter.end()
+    return image
+
+
+def icon_png_bytes(size: int) -> bytes:
+    buffer_bytes = QByteArray()
+    buffer = QBuffer(buffer_bytes)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not render_icon_image(size).save(buffer, "PNG"):
+        raise RuntimeError(f"Simge PNG olarak oluşturulamadı: {size}x{size}")
+    return bytes(buffer_bytes)
+
+
+def _ico_frame_bytes(size: int) -> bytes:
+    if size >= 256:
+        return icon_png_bytes(size)
+    flipped = render_icon_image(size).convertToFormat(QImage.Format.Format_ARGB32).transformed(QTransform().scale(1, -1))
+    xor_bytes = bytes(flipped.constBits())[:size * size * 4]
+    and_row_bytes = ((size + 31) // 32) * 4
+    and_mask = bytearray(and_row_bytes * size)
+    for y in range(size):
+        row_offset = y * size * 4
+        mask_offset = y * and_row_bytes
+        for x in range(size):
+            if xor_bytes[row_offset + x * 4 + 3] == 0:
+                and_mask[mask_offset + (x >> 3)] |= 0x80 >> (x & 7)
+    header = struct.pack("<IIIHHIIIIII", 40, size, size * 2, 1, 32, 0, len(xor_bytes) + len(and_mask), 0, 0, 0, 0)
+    return header + xor_bytes + bytes(and_mask)
+
+
+def write_ico(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sizes = (16, 24, 32, 48, 64, 128, 256)
+    payloads = [(size, _ico_frame_bytes(size)) for size in sizes]
+    offset = 6 + 16 * len(payloads)
+    entries = []
+    for size, data in payloads:
+        dim = 0 if size >= 256 else size
+        entries.append(struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(data), offset))
+        offset += len(data)
+    path.write_bytes(struct.pack("<HHH", 0, 1, len(payloads)) + b"".join(entries) + b"".join(data for _, data in payloads))
+    return path
+
+
+def write_icns(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    types = (
+        (16, b"icp4"), (32, b"icp5"), (64, b"icp6"),
+        (128, b"ic07"), (256, b"ic08"), (512, b"ic09"), (1024, b"ic10"),
+    )
+    chunks = []
+    for size, ostype in types:
+        data = icon_png_bytes(size)
+        chunks.append(ostype + struct.pack(">I", 8 + len(data)) + data)
+    body = b"".join(chunks)
+    path.write_bytes(b"icns" + struct.pack(">I", 8 + len(body)) + body)
+    return path
+
+
+def build_icon_file(directory: Path, platform_name: str | None = None) -> Path:
+    target = platform_name or sys.platform
+    directory.mkdir(parents=True, exist_ok=True)
+    if target == "win32":
+        return write_ico(directory / "YTIndir.ico")
+    if target == "darwin":
+        return write_icns(directory / "YTIndir.icns")
+    path = directory / "YTIndir.png"
+    path.write_bytes(icon_png_bytes(256))
+    return path
+
+
+def app_icon() -> QIcon:
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(QPixmap.fromImage(render_icon_image(size)))
+    return icon
 
 
 
@@ -517,13 +671,22 @@ class Window(QMainWindow):
         self.output_buffer = ""
         self.clip_progress: dict[str, str] = {}
         self.download_streams: dict[str, float] = {}
+        self.download_bytes: dict[str, int] = {}
+        self.source_duration: float | None = None
         self.stream_count = 1
+        self.converting = False
+        self.conversion_started = 0.0
+        self.conversion_estimate = 0.0
+        self.conversion_timer = QTimer(self)
+        self.conversion_timer.setInterval(200)
+        self.conversion_timer.timeout.connect(self.update_conversion_progress)
         self.update_label = "Güncellemeler denetleniyor…"
         self.clip_workspace: tempfile.TemporaryDirectory | None = None
         self.clip_destination: Path | None = None
         self.cutting = False
         self.log_lines: list[str] = []
         self.setWindowTitle("YT İndir · MP3 ve MP4")
+        self.setWindowIcon(app_icon())
         self.resize(760, 620)
         self.setMinimumSize(640, 540)
         self.build_ui()
@@ -540,6 +703,11 @@ class Window(QMainWindow):
         layout.setContentsMargins(30, 26, 30, 26)
         layout.setSpacing(16)
         header = QHBoxLayout()
+        header.setSpacing(12)
+        icon_label = QLabel()
+        icon_label.setPixmap(QPixmap.fromImage(render_icon_image(36)))
+        icon_label.setFixedSize(36, 36)
+        header.addWidget(icon_label)
         header.addWidget(QLabel("YT İndir", objectName="heading"))
         header.addStretch()
         more = QPushButton("Diğer ⋯")
@@ -776,7 +944,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             title = job.url if job.title == "Bağlantı bilgisi bekleniyor" else job.title
             if job.start_time is not None:
                 title += f" [{timestamp_seconds(job.start_time)}–{timestamp_seconds(job.end_time)} sn]"
-            state = f"{job.status} · %{job.progress}" if job.status == "İndiriliyor" else job.status
+            state = f"{job.status} · %{job.progress}" if job.status in ("İndiriliyor", "Dönüştürülüyor") else job.status
             for col, value in enumerate((title, f"{job.format} · {quality}", state)):
                 item = QTableWidgetItem(value)
                 item.setToolTip(job.error or job.output or job.url)
@@ -965,9 +1133,15 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             return
         self.current, self.cancelled = job, False
         self.output_buffer, self.log_lines = "", []
+        self.conversion_timer.stop()
         self.clip_progress = {}
         self.download_streams = {}
+        self.download_bytes = {}
+        self.source_duration = None
         self.stream_count = 1
+        self.converting = False
+        self.conversion_started = 0.0
+        self.conversion_estimate = 0.0
         self.cutting = False
         self.clip_destination = None
         job.status, job.error, job.output, job.progress = "Bilgiler alınıyor", "", "", 0
@@ -1032,18 +1206,25 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             elif line.startswith("__STREAMS__"):
                 streams = json.loads(line[len("__STREAMS__"):])
                 self.stream_count = max(1, len(streams)) if isinstance(streams, list) else 1
+            elif line.startswith("__DURATION__"):
+                duration = json.loads(line[len("__DURATION__"):])
+                if isinstance(duration, (int, float)) and duration > 0:
+                    self.source_duration = float(duration)
             elif line.startswith("__PROGRESS__"):
+                self.conversion_timer.stop()
+                self.converting = False
                 info = json.loads(line[len("__PROGRESS__"):])
                 job.status = "İndiriliyor"
                 total = info.get("total_bytes") or info.get("total_bytes_estimate")
+                downloaded = info.get("downloaded_bytes") or 0
                 stream = info.get("filename") or info.get("tmpfilename") or "download"
-                fraction = 1.0 if info.get("status") == "finished" else min(1.0, (info.get("downloaded_bytes") or 0) / total) if total else 0.0
+                fraction = 1.0 if info.get("status") == "finished" else min(1.0, downloaded / total) if total else 0.0
                 self.download_streams[stream] = max(self.download_streams.get(stream, 0), fraction)
-                limit = 75 if job.start_time is not None else 90
+                self.download_bytes[stream] = max(self.download_bytes.get(stream, 0), int(total or downloaded or 0))
+                limit = self.download_progress_limit(job)
                 self.set_progress(limit * sum(self.download_streams.values()) / max(self.stream_count, len(self.download_streams)))
                 speed = info.get("speed")
                 eta = info.get("eta")
-                downloaded = info.get("downloaded_bytes") or 0
                 details = f" · {downloaded / 1048576:.1f} MB"
                 if total:
                     estimated = "≈ " if not info.get("total_bytes") else ""
@@ -1054,15 +1235,62 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
                     details += f" · Kalan: {int(eta) // 60}:{int(eta) % 60:02d}"
                 self.status.setText(f"İndiriliyor: {job.title}{details}")
             elif line.startswith("__POST__") or line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
-                job.status = "Dönüştürülüyor"
-                self.set_progress(75 if job.start_time is not None else 90)
-                self.status.setText(f"Birleştiriliyor / dönüştürülüyor: {job.title}")
+                self.start_conversion_progress()
             else:
                 self.log_lines.append(line)
                 self.log_lines = self.log_lines[-50:]
                 self.log(line)
         except (ValueError, TypeError, KeyError, ZeroDivisionError):
             self.log(line)
+        self.refresh_table()
+
+    def download_progress_limit(self, job: Job) -> int:
+        return 75 if job.start_time is not None else 80
+
+    def conversion_progress_range(self, job: Job) -> tuple[int, int]:
+        return (75, 84) if job.start_time is not None else (80, 98)
+
+    def estimate_conversion_seconds(self) -> float:
+        job = self.current
+        if not job:
+            return 4.0
+        total_bytes = sum(self.download_bytes.values())
+        duration = self.source_duration or 0.0
+        if job.format == "MP3" and job.start_time is None:
+            by_size = total_bytes / (3.5 * 1048576) if total_bytes else 0.0
+            by_duration = duration / 35.0 if duration else 0.0
+            estimate = max(by_size, by_duration)
+            return max(2.0, min(180.0, (estimate + 1.5) if estimate else 6.0))
+        by_size = total_bytes / (25.0 * 1048576) if total_bytes else 0.0
+        by_duration = duration / 120.0 if duration else 0.0
+        estimate = max(by_size, by_duration)
+        return max(1.5, min(120.0, (estimate + 1.0) if estimate else 4.0))
+
+    def start_conversion_progress(self):
+        job = self.current
+        if not job:
+            return
+        if not self.converting:
+            self.converting = True
+            self.conversion_started = time.monotonic()
+            self.conversion_estimate = self.estimate_conversion_seconds()
+            self.conversion_timer.start()
+        self.update_conversion_progress()
+
+    def update_conversion_progress(self, elapsed: float | None = None):
+        job = self.current
+        if not job or not self.converting or self.cutting:
+            return
+        job.status = "Dönüştürülüyor"
+        duration = max(0.5, self.conversion_estimate or self.estimate_conversion_seconds())
+        if elapsed is None:
+            elapsed = max(0.0, time.monotonic() - self.conversion_started)
+        start_progress, end_progress = self.conversion_progress_range(job)
+        span = end_progress - start_progress
+        self.set_progress(start_progress + min(span, int(elapsed / duration * span)))
+        eta = int(max(0, round(duration - elapsed)))
+        details = f" · {min(elapsed, duration):.1f} / ≈ {duration:.1f} sn · Kalan: {eta // 60}:{eta % 60:02d}"
+        self.status.setText(f"Birleştiriliyor / dönüştürülüyor: {job.title}{details}")
         self.refresh_table()
 
     def handle_clip_progress(self, line: str) -> bool:
@@ -1104,6 +1332,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         if self.output_buffer:
             self.handle_line(self.output_buffer.strip())
             self.output_buffer = ""
+        self.conversion_timer.stop()
+        self.converting = False
         if not self.current:
             return
         if self.cancelled:
@@ -1118,6 +1348,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             self.verify_output()
 
     def start_local_cut(self):
+        self.conversion_timer.stop()
+        self.converting = False
         job = self.current
         source = Path(job.output)
         self.clip_destination = Path(job.folder) / source.with_suffix("." + job.format.lower()).name
@@ -1142,6 +1374,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         self.start_process(str(self.ffmpeg), cut_arguments(job, source, output))
 
     def verify_output(self):
+        self.conversion_timer.stop()
+        self.converting = False
         if not self.clip_destination and self.clip_workspace:
             source = Path(self.current.output)
             if source.parent == Path(self.clip_workspace.name):
@@ -1193,6 +1427,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
             self.finish_job(False, "Çıktı dosyası doğrulanamadı.")
 
     def finish_job(self, success: bool, error: str = ""):
+        self.conversion_timer.stop()
+        self.converting = False
         job = self.current
         if not job:
             return
@@ -1241,6 +1477,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
         if not self.current:
             return
         self.cancelled = True
+        self.conversion_timer.stop()
+        self.converting = False
         if self.probe:
             self.probe.kill()
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
@@ -1312,6 +1550,12 @@ def main() -> int:
         _smoke_fault_log = diagnostic_path.open("a", encoding="utf-8")
         faulthandler.enable(file=_smoke_fault_log)
         smoke_stage("Starting Qt application")
+    if "--build-icon" in sys.argv:
+        index = sys.argv.index("--build-icon")
+        target_dir = Path(sys.argv[index + 1]) if index + 1 < len(sys.argv) else Path("build/icons")
+        path = build_icon_file(target_dir)
+        print(path)
+        return 0
     if "--check-bundle" in sys.argv:
         root = application_data_dir()
         root.mkdir(parents=True, exist_ok=True)
@@ -1344,6 +1588,7 @@ def main() -> int:
     smoke_stage(f"Qt application ready; platform={app.platformName()}")
     app.setOrganizationName("YTIndir")
     app.setApplicationName("YTIndir")
+    app.setWindowIcon(app_icon())
     # Overrides are useful for portable installations and isolated smoke tests.
     data_dir = application_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)

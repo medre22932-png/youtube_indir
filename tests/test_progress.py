@@ -9,7 +9,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
-from youtube_indir import Job, Window, download_arguments, cut_arguments, cleanup_downloads
+from youtube_indir import (
+    Job, Window, app_icon, build_icon_file, cleanup_downloads, cut_arguments, download_arguments,
+)
 
 
 class DownloadProgressTests(unittest.TestCase):
@@ -91,12 +93,30 @@ class DownloadProgressTests(unittest.TestCase):
     def test_full_downloads_show_bytes_without_a_total(self):
         self.job.start_time = self.job.end_time = None
         self.window.handle_line('__PROGRESS__{"downloaded_bytes": 10485760, "total_bytes": 20971520}')
-        self.assertEqual(self.job.progress, 45)
+        self.assertEqual(self.job.progress, 40)
         self.assertIn("10.0 MB / 20.0 MB", self.window.status.text())
         self.window.handle_line('__PROGRESS__{"downloaded_bytes": 3145728}')
         self.assertIn("3.0 MB", self.window.status.text())
         self.assertEqual(self.window.progress.maximum(), 100)
-        self.assertEqual(self.job.progress, 45)
+        self.assertEqual(self.job.progress, 40)
+
+    def test_conversion_uses_estimated_time_and_progress_portion(self):
+        self.job.start_time = self.job.end_time = None
+        self.job.format, self.job.quality = "MP3", "192"
+        self.window.handle_line("__DURATION__210")
+        self.window.handle_line('__PROGRESS__{"downloaded_bytes": 7340032, "total_bytes": 7340032, "status": "finished"}')
+        self.assertEqual(self.job.progress, 80)
+        self.window.handle_line("__POST__{}")
+        self.assertEqual(self.job.status, "Dönüştürülüyor")
+        self.assertEqual(self.job.progress, 80)
+        self.assertGreater(self.window.conversion_estimate, 7.0)
+        self.assertIn("Kalan:", self.window.status.text())
+        self.window.update_conversion_progress(self.window.conversion_estimate / 2)
+        self.assertEqual(self.job.progress, 89)
+        self.assertIn("Dönüştürülüyor · %89", self.window.table.item(0, 2).text())
+        self.window.update_conversion_progress(self.window.conversion_estimate)
+        self.assertEqual(self.job.progress, 98)
+        self.assertIn("Kalan: 0:00", self.window.status.text())
 
     def test_separate_streams_and_stages_never_reset_progress(self):
         self.window.handle_line('__STREAMS__["video", "audio"]')
@@ -189,6 +209,16 @@ class DownloadProgressTests(unittest.TestCase):
         self.window.cancelled = True
         self.window.finish_job(False, "cancelled")
         self.assertFalse(workspace.exists())
+
+    def test_icon_generation_supports_windows_macos_and_window_icon(self):
+        self.assertFalse(self.window.windowIcon().isNull())
+        self.assertGreaterEqual(len(app_icon().availableSizes()), 7)
+        ico = build_icon_file(Path(self.directory.name), "win32")
+        icns = build_icon_file(Path(self.directory.name), "darwin")
+        self.assertEqual(ico.name, "YTIndir.ico")
+        self.assertEqual(icns.name, "YTIndir.icns")
+        self.assertEqual(ico.read_bytes()[:4], b"\x00\x00\x01\x00")
+        self.assertEqual(icns.read_bytes()[:4], b"icns")
 
 
 if __name__ == "__main__":

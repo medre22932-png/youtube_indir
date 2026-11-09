@@ -102,6 +102,7 @@ jobs:
 
       - name: Build Executable with PyInstaller
         run: |
+          python youtube_indir.py --build-icon build/icons
           pyinstaller --clean --noconfirm YTIndir.spec
 
       - name: Upload Windows Executable Directly to Release
@@ -149,6 +150,7 @@ jobs:
 
       - name: Build macOS App Bundle
         run: |
+          python youtube_indir.py --build-icon build/icons
           pyinstaller --clean --noconfirm YTIndir.spec
 
       - name: Package macOS App into Zip
