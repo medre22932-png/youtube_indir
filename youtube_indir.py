@@ -12,6 +12,7 @@ if sys.stderr is None:
 
 
 import json
+import math
 import os
 import platform
 import shutil
@@ -583,17 +584,48 @@ from requests.adapters import HTTPAdapter
 
 from PySide6.QtCore import (
     QBuffer, QByteArray, QEasingCurve, QIODevice, QObject, QPointF, QPropertyAnimation,
-    QProcess, QProcessEnvironment, QRectF, Qt, QThread, QTimer, QUrl, Signal,
+    QProcess, QProcessEnvironment, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor, QDesktopServices, QIcon, QImage, QLinearGradient, QPainter,
     QPainterPath, QPen, QPixmap, QRadialGradient, QTransform,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QListView,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QMenu, QScrollArea, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QMenu, QScrollArea, QPushButton, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
+
+
+class QualityComboBox(QComboBox):
+    def wheelEvent(self, event):
+        # Let the page scroll without accidentally changing download quality.
+        event.ignore()
+
+
+def gear_icon() -> QIcon:
+    image = QImage(48, 48, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    image.setDevicePixelRatio(2)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    gear = QPainterPath()
+    for index in range(32):
+        angle = math.tau * index / 32
+        radius = 10 if index % 4 in (1, 2) else 8
+        point = QPointF(12 + radius * math.cos(angle), 12 + radius * math.sin(angle))
+        if index == 0:
+            gear.moveTo(point)
+        else:
+            gear.lineTo(point)
+    gear.closeSubpath()
+    gear.addEllipse(QRectF(8, 8, 8, 8))
+    gear.setFillRule(Qt.FillRule.OddEvenFill)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#e6edf7"))
+    painter.drawPath(gear)
+    painter.end()
+    return QIcon(QPixmap.fromImage(image))
 
 
 def render_icon_image(size: int = 256) -> QImage:
@@ -1608,16 +1640,9 @@ class Window(QMainWindow):
             button.clicked.connect(lambda checked=False, value=value: self.select_format(value))
             formats.addWidget(button)
         layout.addLayout(formats)
-        self.quality = QComboBox()
+        self.quality = QualityComboBox(root)
         self.quality.setObjectName("downloadQuality")
-        self.quality.setView(QListView())
-        self.quality.setStyleSheet("""
-QComboBox#downloadQuality QAbstractItemView {
-    color: black; background-color: white;
-    selection-color: black; selection-background-color: #c9dfff;
-}
-""")
-        self.quality.setMinimumHeight(36)
+        self.quality.hide()
         self.format.currentTextChanged.connect(self.update_qualities)
         self.update_qualities()
         self.select_format(self.format.currentText())
@@ -1656,31 +1681,47 @@ QComboBox#downloadQuality QAbstractItemView {
         self.clip_enabled.toggled.connect(self.clip_options.setVisible)
         layout.addWidget(self.clip_options)
 
-        options_button = QPushButton("Kalite ve ayarlar ▸")
-        options_button.setCheckable(True)
-        layout.addWidget(options_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.options = QWidget()
-        options_layout = QVBoxLayout(self.options)
-        options_layout.setContentsMargins(0, 0, 0, 0)
-        quality_row = QHBoxLayout()
-        quality_row.addWidget(QLabel("İndirme kalitesi"))
-        quality_row.addWidget(self.quality, 1)
-        options_layout.addLayout(quality_row)
-        self.engine_status = QLabel("Gerekli güncellemeler otomatik denetlenir.", objectName="subheading")
-        self.engine_status.setWordWrap(True)
-        options_layout.addWidget(self.engine_status)
-        self.options.hide()
-        options_button.toggled.connect(self.options.setVisible)
-        options_button.toggled.connect(lambda checked: options_button.setText(
-            "Kalite ve ayarlar ▾" if checked else "Kalite ve ayarlar ▸"))
-        layout.addWidget(self.options)
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(6)
+        settings_row.addWidget(QLabel("Kalite"))
+        self.quality_button = QToolButton()
+        self.quality_button.setIcon(gear_icon())
+        self.quality_button.setIconSize(QSize(24, 24))
+        self.quality_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.quality_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.quality_button.setStyleSheet("""
+QToolButton { background: transparent; border: none; padding: 4px; }
+QToolButton::menu-indicator { image: none; }
+""")
+        self.quality_button.setAccessibleName("İndirme kalitesi")
+        self.quality_button.setToolTip("İndirme kalitesi")
+        quality_menu = QMenu(self.quality_button)
+
+        def populate_quality_menu():
+            quality_menu.clear()
+            for index in range(self.quality.count()):
+                action = quality_menu.addAction(self.quality.itemText(index))
+                action.setCheckable(True)
+                action.setChecked(index == self.quality.currentIndex())
+                action.triggered.connect(
+                    lambda checked=False, index=index: self.quality.setCurrentIndex(index))
+
+        quality_menu.aboutToShow.connect(populate_quality_menu)
+        self.quality_button.setMenu(quality_menu)
+        settings_row.addWidget(self.quality_button)
+        settings_row.addStretch()
+        layout.addLayout(settings_row)
 
         advanced_button = QPushButton("Gelişmiş ayarlar ▸")
         advanced_button.setCheckable(True)
-        options_layout.addWidget(advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.advanced_options = QWidget()
         advanced_layout = QVBoxLayout(self.advanced_options)
         advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.addWidget(QLabel("İndirme motoru"))
+        self.engine_status = QLabel("Gerekli güncellemeler otomatik denetlenir.", objectName="subheading")
+        self.engine_status.setWordWrap(True)
+        advanced_layout.addWidget(self.engine_status)
         self.skip_transcoding = QCheckBox("1440p ve 2160p için decoding’i atla")
         self.skip_transcoding.setChecked(self.settings.value("skip_transcoding", False) is True)
         self.skip_transcoding.toggled.connect(
@@ -1697,8 +1738,7 @@ QComboBox#downloadQuality QAbstractItemView {
         advanced_button.toggled.connect(self.advanced_options.setVisible)
         advanced_button.toggled.connect(lambda checked: advanced_button.setText(
             "Gelişmiş ayarlar ▾" if checked else "Gelişmiş ayarlar ▸"))
-        options_button.toggled.connect(lambda checked: advanced_button.setChecked(False) if not checked else None)
-        options_layout.addWidget(self.advanced_options)
+        layout.addWidget(self.advanced_options)
 
         actions = QHBoxLayout()
         self.start = QPushButton("İndir", objectName="primary")
